@@ -17,6 +17,9 @@ import {
   setTrackName,
   setTrackColor,
   clonePattern,
+  addClip,
+  removeClip,
+  moveClip,
   MutationError,
 } from "../src/mutations/index.ts";
 import { buildArrangements } from "../src/parser/project-builder.ts";
@@ -471,6 +474,101 @@ describe("clonePattern", () => {
   test("rejects iid < 1", () => {
     const project = loadProject(FIXTURE);
     expect(() => clonePattern(project, 0)).toThrow(MutationError);
+  });
+});
+
+describe("addClip / removeClip / moveClip", () => {
+  test("addClip places a pattern clip on a specific track + position", () => {
+    const project = loadProject(FIXTURE);
+    const m = addClip(project, 0, {
+      kind: "pattern",
+      ref_id: 1,
+      track_index: 2,
+      position_ticks: 384,
+      length_ticks: 384,
+    });
+    const reparsed = reparse(m);
+    const channels = buildChannels(reparsed.events, reparsed.metadata);
+    const arrs = buildArrangements(
+      reparsed.events,
+      channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    );
+    const clips = arrs[0]!.clips;
+    expect(clips.length).toBe(1);
+    expect(clips[0]!.position).toBe(384);
+    expect(clips[0]!.length).toBe(384);
+    expect(clips[0]!.item_index).toBe(1 + 20480); // pattern_base
+    expect(clips[0]!.track_rvidx).toBe(499 - 2); // un-reversed track 2
+  });
+
+  test("addClip multiple appends to same blob", () => {
+    let p = loadProject(FIXTURE);
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 0, position_ticks: 0, length_ticks: 96 });
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 1, position_ticks: 96, length_ticks: 96 });
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 2, position_ticks: 192, length_ticks: 96 });
+    const re = reparse(p);
+    const channels = buildChannels(re.events, re.metadata);
+    const arrs = buildArrangements(re.events, channels, re.patterns, re.metadata);
+    expect(arrs[0]!.clips.length).toBe(3);
+  });
+
+  test("removeClip drops matching record by track + position", () => {
+    let p = loadProject(FIXTURE);
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 0, position_ticks: 0, length_ticks: 96 });
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 1, position_ticks: 0, length_ticks: 96 });
+    p = removeClip(p, 0, { track_index: 0, position_ticks: 0 });
+    const re = reparse(p);
+    const channels = buildChannels(re.events, re.metadata);
+    const arrs = buildArrangements(re.events, channels, re.patterns, re.metadata);
+    expect(arrs[0]!.clips.length).toBe(1);
+    expect(arrs[0]!.clips[0]!.track_rvidx).toBe(499 - 1); // track 1 survived
+  });
+
+  test("removeClip throws EVENT_NOT_FOUND when no match", () => {
+    const p = loadProject(FIXTURE);
+    expect(() => removeClip(p, 0, { track_index: 99 })).toThrow(MutationError);
+  });
+
+  test("moveClip patches track in place", () => {
+    let p = loadProject(FIXTURE);
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 0, position_ticks: 100, length_ticks: 96 });
+    p = moveClip(p, 0, { track_index: 0, position_ticks: 100 }, { track_index: 7 });
+    const re = reparse(p);
+    const channels = buildChannels(re.events, re.metadata);
+    const arrs = buildArrangements(re.events, channels, re.patterns, re.metadata);
+    expect(arrs[0]!.clips[0]!.track_rvidx).toBe(499 - 7);
+    expect(arrs[0]!.clips[0]!.position).toBe(100); // position unchanged
+  });
+
+  test("moveClip patches both track + position", () => {
+    let p = loadProject(FIXTURE);
+    p = addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 0, position_ticks: 0, length_ticks: 96 });
+    p = moveClip(p, 0, { track_index: 0, position_ticks: 0 }, { track_index: 5, position_ticks: 192 });
+    const re = reparse(p);
+    const channels = buildChannels(re.events, re.metadata);
+    const arrs = buildArrangements(re.events, channels, re.patterns, re.metadata);
+    expect(arrs[0]!.clips[0]!.track_rvidx).toBe(499 - 5);
+    expect(arrs[0]!.clips[0]!.position).toBe(192);
+  });
+
+  test("moveClip rejects empty destination", () => {
+    const p = loadProject(FIXTURE);
+    expect(() => moveClip(p, 0, { track_index: 0 }, {})).toThrow(MutationError);
+  });
+
+  test("clip placement validates ticks + index ranges", () => {
+    const p = loadProject(FIXTURE);
+    expect(() =>
+      addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 0, position_ticks: -1, length_ticks: 1 }),
+    ).toThrow(MutationError);
+    expect(() =>
+      addClip(p, 0, { kind: "pattern", ref_id: 1, track_index: 500, position_ticks: 0, length_ticks: 1 }),
+    ).toThrow(MutationError);
+    expect(() =>
+      addClip(p, 0, { kind: "pattern", ref_id: 0, track_index: 0, position_ticks: 0, length_ticks: 1 }),
+    ).toThrow(MutationError);
   });
 });
 

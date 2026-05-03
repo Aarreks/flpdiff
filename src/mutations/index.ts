@@ -1032,6 +1032,323 @@ export function setTrackColor(
 }
 
 // --------------------------------------------------------------------------- //
+// addClip / removeClip / moveClip — playlist clip mutations
+// --------------------------------------------------------------------------- //
+
+const OP_PLAYLIST = 0xe9;
+const PATTERN_BASE = 20480;
+const TRACK_MAX = 499;
+const CLIP_RECORD_SIZE = 60; // FL 21+ default; pre-FL-21 was 32
+
+export type ClipPlacement = {
+  /** "pattern" → reference a pattern by id; "channel" → reference a channel by iid. */
+  kind: "pattern" | "channel";
+  /** Pattern id (1-based) or channel iid (0-based). */
+  ref_id: number;
+  /** 0-based track index from FL display order (0 = top). Internally stored reversed. */
+  track_index: number;
+  /** Tick position on the playlist timeline. */
+  position_ticks: number;
+  /** Clip length in ticks. */
+  length_ticks: number;
+};
+
+function findArrangementBounds(
+  events: readonly FLPEvent[],
+  arrangementId: number,
+): { openIdx: number; endIdx: number } {
+  let openIdx = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind === "u16" &&
+      ev.opcode === OP_ARRANGEMENT_NEW &&
+      ev.value === arrangementId
+    ) {
+      openIdx = i;
+      break;
+    }
+  }
+  if (openIdx === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no arrangement with id=${arrangementId} found`,
+    );
+  }
+  let endIdx = events.length;
+  for (let i = openIdx + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) {
+      endIdx = i;
+      break;
+    }
+  }
+  return { openIdx, endIdx };
+}
+
+function encodeClipRecord(
+  position: number,
+  itemIndex: number,
+  length: number,
+  trackRvidx: number,
+): Uint8Array {
+  // 60-byte FL 21+ record. Reserved bytes (_u1 16-17, _u2 20-23, _u3 32-59)
+  // stay zero — FL tolerates zero-reserved on freshly-written clips.
+  const buf = new Uint8Array(CLIP_RECORD_SIZE);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, position, true);
+  view.setUint16(4, PATTERN_BASE, true); // pattern_base sentinel
+  view.setUint16(6, itemIndex, true);
+  view.setUint32(8, length, true);
+  view.setUint16(12, trackRvidx, true);
+  view.setUint16(14, 0, true); // group
+  // 16-17 reserved
+  view.setUint16(18, 0, true); // item_flags — default
+  // 20-23 reserved
+  view.setFloat32(24, 0.0, true); // start_offset
+  view.setFloat32(28, 0.0, true); // end_offset
+  // 32-59 reserved (FL 21+)
+  return buf;
+}
+
+function resolveItemIndex(placement: ClipPlacement): number {
+  if (placement.kind === "pattern") {
+    if (!Number.isInteger(placement.ref_id) || placement.ref_id < 1) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `pattern ref_id must be a positive integer, got ${placement.ref_id}`,
+      );
+    }
+    return placement.ref_id + PATTERN_BASE;
+  }
+  if (!Number.isInteger(placement.ref_id) || placement.ref_id < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `channel ref_id must be a non-negative integer, got ${placement.ref_id}`,
+    );
+  }
+  return placement.ref_id;
+}
+
+function resolveTrackRvidx(trackIndex: number): number {
+  if (!Number.isInteger(trackIndex) || trackIndex < 0 || trackIndex > TRACK_MAX) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `track_index must be integer in [0, ${TRACK_MAX}], got ${trackIndex}`,
+    );
+  }
+  return TRACK_MAX - trackIndex;
+}
+
+/**
+ * Append a new playlist clip to arrangement `arrangementId`. If the
+ * arrangement already has at least one `0xE9` blob, the new record is
+ * appended to the LAST one (preserving all original bytes verbatim).
+ * Otherwise a fresh `0xE9` blob is inserted at the end of the
+ * arrangement scope.
+ */
+export function addClip(
+  project: FLPProject,
+  arrangementId: number,
+  placement: ClipPlacement,
+): FLPProject {
+  if (!Number.isInteger(placement.position_ticks) || placement.position_ticks < 0) {
+    throw new MutationError("INVALID_ARGS", "position_ticks must be non-negative integer");
+  }
+  if (!Number.isInteger(placement.length_ticks) || placement.length_ticks < 1) {
+    throw new MutationError("INVALID_ARGS", "length_ticks must be positive integer");
+  }
+  const itemIndex = resolveItemIndex(placement);
+  const trackRvidx = resolveTrackRvidx(placement.track_index);
+  const newRecord = encodeClipRecord(
+    placement.position_ticks,
+    itemIndex,
+    placement.length_ticks,
+    trackRvidx,
+  );
+
+  const events = [...project.events];
+  const { openIdx, endIdx } = findArrangementBounds(events, arrangementId);
+
+  // Find LAST 0xE9 in arrangement scope.
+  let lastBlobIdx = -1;
+  for (let i = openIdx + 1; i < endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_PLAYLIST) {
+      lastBlobIdx = i;
+    }
+  }
+
+  if (lastBlobIdx === -1) {
+    // No playlist blob yet — insert one before the next arrangement
+    // (or at end of arrangement scope).
+    events.splice(endIdx, 0, { kind: "blob", opcode: OP_PLAYLIST, payload: newRecord });
+    return { ...project, events };
+  }
+  const orig = events[lastBlobIdx]!;
+  if (orig.kind !== "blob") throw new MutationError("UNKNOWN", "0xE9 not blob");
+  // Append: concat originalPayload + newRecord. Preserves every byte
+  // of every existing record verbatim.
+  const merged = new Uint8Array(orig.payload.byteLength + newRecord.byteLength);
+  merged.set(orig.payload, 0);
+  merged.set(newRecord, orig.payload.byteLength);
+  events[lastBlobIdx] = { kind: "blob", opcode: OP_PLAYLIST, payload: merged };
+  return { ...project, events };
+}
+
+export type ClipMatch = {
+  /** Match clips on this track (FL display order, 0 = top). Required. */
+  track_index: number;
+  /** Match only clips at exactly this tick position. Optional. */
+  position_ticks?: number;
+  /** Match only clips referencing this pattern id (>0) or channel iid. Optional. */
+  ref_id?: number;
+  /** Disambiguates ref_id resolution when pattern_id / channel_iid overlap. Optional. */
+  kind?: "pattern" | "channel";
+};
+
+function clipMatches(
+  match: ClipMatch,
+  recordPosition: number,
+  recordItemIndex: number,
+  recordTrackRvidx: number,
+): boolean {
+  if (resolveTrackRvidx(match.track_index) !== recordTrackRvidx) return false;
+  if (match.position_ticks !== undefined && match.position_ticks !== recordPosition) {
+    return false;
+  }
+  if (match.ref_id !== undefined) {
+    const isPattern = recordItemIndex > PATTERN_BASE;
+    const recordRef = isPattern ? recordItemIndex - PATTERN_BASE : recordItemIndex;
+    if (match.kind !== undefined) {
+      const expectedKind = isPattern ? "pattern" : "channel";
+      if (match.kind !== expectedKind) return false;
+    }
+    if (match.ref_id !== recordRef) return false;
+  }
+  return true;
+}
+
+/**
+ * Drop ALL playlist clips matching `match` from arrangement
+ * `arrangementId`. Returns the unchanged project if no matches.
+ */
+export function removeClip(
+  project: FLPProject,
+  arrangementId: number,
+  match: ClipMatch,
+): FLPProject {
+  const events = [...project.events];
+  const { openIdx, endIdx } = findArrangementBounds(events, arrangementId);
+  let touched = false;
+
+  for (let i = openIdx + 1; i < endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind !== "blob" || ev.opcode !== OP_PLAYLIST) continue;
+    const recordSize =
+      ev.payload.byteLength % 60 === 0 ? 60 : ev.payload.byteLength % 32 === 0 ? 32 : 0;
+    if (recordSize === 0) continue;
+    const view = new DataView(
+      ev.payload.buffer,
+      ev.payload.byteOffset,
+      ev.payload.byteLength,
+    );
+    const keepRecords: Uint8Array[] = [];
+    let dropped = false;
+    for (let p = 0; p + recordSize <= ev.payload.byteLength; p += recordSize) {
+      const pos = view.getUint32(p, true);
+      const itemIdx = view.getUint16(p + 6, true);
+      const trackRv = view.getUint16(p + 12, true);
+      if (clipMatches(match, pos, itemIdx, trackRv)) {
+        dropped = true;
+        continue;
+      }
+      keepRecords.push(ev.payload.slice(p, p + recordSize));
+    }
+    if (!dropped) continue;
+    touched = true;
+    if (keepRecords.length === 0) {
+      // Drop the entire blob (no clips left in this 0xE9).
+      events.splice(i, 1);
+      i -= 1; // re-scan adjacent
+      continue;
+    }
+    const merged = new Uint8Array(keepRecords.reduce((s, r) => s + r.byteLength, 0));
+    let off = 0;
+    for (const r of keepRecords) {
+      merged.set(r, off);
+      off += r.byteLength;
+    }
+    events[i] = { kind: "blob", opcode: OP_PLAYLIST, payload: merged };
+  }
+
+  if (!touched) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no clips matched in arrangement ${arrangementId}`,
+    );
+  }
+  return { ...project, events };
+}
+
+/**
+ * Move clips matching `match` to a new track and/or position. Patches
+ * the existing record bytes in place — preserves all reserved fields.
+ */
+export function moveClip(
+  project: FLPProject,
+  arrangementId: number,
+  match: ClipMatch,
+  to: { track_index?: number; position_ticks?: number },
+): FLPProject {
+  if (to.track_index === undefined && to.position_ticks === undefined) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      "moveClip requires at least one of {track_index, position_ticks}",
+    );
+  }
+  if (to.position_ticks !== undefined && (!Number.isInteger(to.position_ticks) || to.position_ticks < 0)) {
+    throw new MutationError("INVALID_ARGS", "to.position_ticks must be non-negative integer");
+  }
+  const newRvidx = to.track_index !== undefined ? resolveTrackRvidx(to.track_index) : undefined;
+
+  const events = [...project.events];
+  const { openIdx, endIdx } = findArrangementBounds(events, arrangementId);
+  let touched = false;
+
+  for (let i = openIdx + 1; i < endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind !== "blob" || ev.opcode !== OP_PLAYLIST) continue;
+    const recordSize =
+      ev.payload.byteLength % 60 === 0 ? 60 : ev.payload.byteLength % 32 === 0 ? 32 : 0;
+    if (recordSize === 0) continue;
+    const newPayload = new Uint8Array(ev.payload);
+    const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+    let blobTouched = false;
+    for (let p = 0; p + recordSize <= newPayload.byteLength; p += recordSize) {
+      const pos = view.getUint32(p, true);
+      const itemIdx = view.getUint16(p + 6, true);
+      const trackRv = view.getUint16(p + 12, true);
+      if (!clipMatches(match, pos, itemIdx, trackRv)) continue;
+      if (to.position_ticks !== undefined) view.setUint32(p, to.position_ticks, true);
+      if (newRvidx !== undefined) view.setUint16(p + 12, newRvidx, true);
+      blobTouched = true;
+      touched = true;
+    }
+    if (blobTouched) {
+      events[i] = { kind: "blob", opcode: OP_PLAYLIST, payload: newPayload };
+    }
+  }
+  if (!touched) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no clips matched in arrangement ${arrangementId}`,
+    );
+  }
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
 // helpers
 // --------------------------------------------------------------------------- //
 

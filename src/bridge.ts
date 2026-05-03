@@ -54,8 +54,13 @@ import {
   setTrackName,
   setTrackColor,
   clonePattern,
+  addClip,
+  removeClip,
+  moveClip,
   MutationError,
   type RGBA,
+  type ClipPlacement,
+  type ClipMatch,
 } from "./mutations/index.ts";
 
 type BridgeRequest = {
@@ -104,7 +109,63 @@ const WRITE_KINDS = new Set([
   "set_track_name",
   "set_track_color",
   "clone_pattern",
+  "add_clip",
+  "remove_clip",
+  "move_clip",
 ]);
+
+function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
+  const kind = args["kind"];
+  if (kind !== "pattern" && kind !== "channel") {
+    throw new MutationError("INVALID_ARGS", "args.kind must be 'pattern' or 'channel'");
+  }
+  const refId = Number(args["ref_id"]);
+  const trackIdx = Number(args["track_index"]);
+  const pos = Number(args["position_ticks"]);
+  const len = Number(args["length_ticks"]);
+  if (![refId, trackIdx, pos, len].every(Number.isFinite)) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      "args.ref_id, args.track_index, args.position_ticks, args.length_ticks all required (numbers)",
+    );
+  }
+  return {
+    kind,
+    ref_id: refId,
+    track_index: trackIdx,
+    position_ticks: pos,
+    length_ticks: len,
+  };
+}
+
+function parseMatchArg(args: Record<string, unknown>): ClipMatch {
+  const trackIdx = Number(args["track_index"]);
+  if (!Number.isFinite(trackIdx)) {
+    throw new MutationError("INVALID_ARGS", "args.track_index is required (non-negative integer)");
+  }
+  const out: ClipMatch = { track_index: trackIdx };
+  if (args["position_ticks"] !== undefined) {
+    const p = Number(args["position_ticks"]);
+    if (!Number.isFinite(p)) {
+      throw new MutationError("INVALID_ARGS", "args.position_ticks must be number when provided");
+    }
+    out.position_ticks = p;
+  }
+  if (args["ref_id"] !== undefined) {
+    const r = Number(args["ref_id"]);
+    if (!Number.isFinite(r)) {
+      throw new MutationError("INVALID_ARGS", "args.ref_id must be number when provided");
+    }
+    out.ref_id = r;
+  }
+  if (args["kind"] !== undefined) {
+    if (args["kind"] !== "pattern" && args["kind"] !== "channel") {
+      throw new MutationError("INVALID_ARGS", "args.kind must be 'pattern' or 'channel'");
+    }
+    out.kind = args["kind"];
+  }
+  return out;
+}
 
 function parseRGBAArg(args: Record<string, unknown>): RGBA {
   const c = args["color"];
@@ -277,6 +338,39 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "args.track is required (non-negative integer)");
       }
       mutated = setTrackColor(project, arrId, trackIdx, parseRGBAArg(args));
+    } else if (kind === "add_clip") {
+      const arrId = Number(args["arrangement"] ?? 0);
+      if (!Number.isFinite(arrId)) {
+        throw new MutationError("INVALID_ARGS", "args.arrangement must be a non-negative integer");
+      }
+      mutated = addClip(project, arrId, parsePlacementArg(args));
+    } else if (kind === "remove_clip") {
+      const arrId = Number(args["arrangement"] ?? 0);
+      if (!Number.isFinite(arrId)) {
+        throw new MutationError("INVALID_ARGS", "args.arrangement must be a non-negative integer");
+      }
+      mutated = removeClip(project, arrId, parseMatchArg(args));
+    } else if (kind === "move_clip") {
+      const arrId = Number(args["arrangement"] ?? 0);
+      if (!Number.isFinite(arrId)) {
+        throw new MutationError("INVALID_ARGS", "args.arrangement must be a non-negative integer");
+      }
+      const to: { track_index?: number; position_ticks?: number } = {};
+      if (args["to_track_index"] !== undefined) {
+        const t = Number(args["to_track_index"]);
+        if (!Number.isFinite(t)) {
+          throw new MutationError("INVALID_ARGS", "args.to_track_index must be a number");
+        }
+        to.track_index = t;
+      }
+      if (args["to_position_ticks"] !== undefined) {
+        const p = Number(args["to_position_ticks"]);
+        if (!Number.isFinite(p)) {
+          throw new MutationError("INVALID_ARGS", "args.to_position_ticks must be a number");
+        }
+        to.position_ticks = p;
+      }
+      mutated = moveClip(project, arrId, parseMatchArg(args), to);
     } else if (kind === "clone_pattern") {
       const iid = Number(args["source_iid"]);
       const newName = args["name"];
