@@ -15,6 +15,7 @@ import {
   setChannelRouting,
   setArrangementName,
   setTrackName,
+  setTrackColor,
   clonePattern,
   MutationError,
 } from "../src/mutations/index.ts";
@@ -393,6 +394,43 @@ describe("setTrackName", () => {
   test("EVENT_NOT_FOUND for out-of-range track index", () => {
     const project = loadProject(FIXTURE);
     expect(() => setTrackName(project, 0, 999_999, "x")).toThrow(MutationError);
+  });
+});
+
+describe("setTrackColor", () => {
+  test("changes a track's color (round-trip via 0xEE blob patch)", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setTrackColor(project, 0, 0, { r: 220, g: 50, b: 100 });
+    const reparsed = reparse(mutated);
+    const channels = buildChannels(reparsed.events, reparsed.metadata);
+    const arrs = buildArrangements(
+      reparsed.events,
+      channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    );
+    expect(arrs[0]?.tracks[0]?.color).toEqual({ r: 220, g: 50, b: 100, a: 0 });
+  });
+
+  test("preserves all other track-data bytes", () => {
+    const project = loadProject(FIXTURE);
+    const before = project.events.find(
+      (e) => e.kind === "blob" && e.opcode === 0xee,
+    );
+    const mutated = setTrackColor(project, 0, 0, { r: 10, g: 20, b: 30 });
+    const after = mutated.events.find((e) => e.kind === "blob" && e.opcode === 0xee);
+    if (before?.kind !== "blob" || after?.kind !== "blob") throw new Error("expected blob");
+    expect(after.payload.byteLength).toBe(before.payload.byteLength);
+    // Bytes 0-3 (iid), 8+ (icon, enabled, height, locked, etc.) unchanged.
+    for (let i = 0; i < 4; i++) expect(after.payload[i]).toBe(before.payload[i]!);
+    for (let i = 8; i < before.payload.byteLength; i++) {
+      expect(after.payload[i]).toBe(before.payload[i]!);
+    }
+  });
+
+  test("EVENT_NOT_FOUND for missing track", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setTrackColor(project, 0, 99999, { r: 0, g: 0, b: 0 })).toThrow(MutationError);
   });
 });
 

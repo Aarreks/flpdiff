@@ -938,6 +938,100 @@ export function clonePattern(
 }
 
 // --------------------------------------------------------------------------- //
+// setTrackColor
+// --------------------------------------------------------------------------- //
+
+/**
+ * Replace track color inside the 70-byte `0xEE` track-data blob.
+ * The color lives at bytes 4-7 (uint32 LE, RGBA-packed same as
+ * channel/insert colors per `decodeTrackData`).
+ *
+ * No full encoder needed — we copy the existing payload, patch bytes
+ * 4-7 in place, write back. All other fields (icon, enabled, height,
+ * locked, plus the trailing motion/press/etc. we don't surface) are
+ * preserved bit-exact.
+ */
+export function setTrackColor(
+  project: FLPProject,
+  arrangementId: number,
+  trackIndex: number,
+  rgba: RGBA,
+): FLPProject {
+  if (!Number.isInteger(arrangementId) || arrangementId < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `arrangement id must be a non-negative integer, got ${arrangementId}`,
+    );
+  }
+  if (!Number.isInteger(trackIndex) || trackIndex < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `track index must be a non-negative integer, got ${trackIndex}`,
+    );
+  }
+  const colorU32 = packRGBA(rgba);
+
+  const events = [...project.events];
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind === "u16" &&
+      ev.opcode === OP_ARRANGEMENT_NEW &&
+      ev.value === arrangementId
+    ) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no arrangement with id=${arrangementId} found`,
+    );
+  }
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) {
+      endIndex = i;
+      break;
+    }
+  }
+
+  let trackBlobIdx = -1;
+  let seen = -1;
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_TRACK_DATA) {
+      seen += 1;
+      if (seen === trackIndex) {
+        trackBlobIdx = i;
+        break;
+      }
+    }
+  }
+  if (trackBlobIdx === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `arrangement ${arrangementId} has no track at index ${trackIndex} (only ${seen + 1} tracks)`,
+    );
+  }
+  const orig = events[trackBlobIdx]!;
+  if (orig.kind !== "blob" || orig.payload.byteLength < 8) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `track-data blob too small (${orig.kind === "blob" ? orig.payload.byteLength : 0} bytes); needs >= 8 for color`,
+    );
+  }
+  const newPayload = new Uint8Array(orig.payload);
+  const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+  view.setUint32(4, colorU32, true);
+  events[trackBlobIdx] = { kind: "blob", opcode: OP_TRACK_DATA, payload: newPayload };
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
 // helpers
 // --------------------------------------------------------------------------- //
 

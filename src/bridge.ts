@@ -52,6 +52,7 @@ import {
   setChannelRouting,
   setArrangementName,
   setTrackName,
+  setTrackColor,
   clonePattern,
   MutationError,
   type RGBA,
@@ -101,6 +102,7 @@ const WRITE_KINDS = new Set([
   "set_channel_routing",
   "set_arrangement_name",
   "set_track_name",
+  "set_track_color",
   "clone_pattern",
 ]);
 
@@ -265,6 +267,16 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "args.name is required (string)");
       }
       mutated = setTrackName(project, arrId, trackIdx, name);
+    } else if (kind === "set_track_color") {
+      const arrId = Number(args["arrangement"] ?? 0);
+      const trackIdx = Number(args["track"]);
+      if (!Number.isFinite(arrId)) {
+        throw new MutationError("INVALID_ARGS", "args.arrangement must be a non-negative integer");
+      }
+      if (!Number.isFinite(trackIdx)) {
+        throw new MutationError("INVALID_ARGS", "args.track is required (non-negative integer)");
+      }
+      mutated = setTrackColor(project, arrId, trackIdx, parseRGBAArg(args));
     } else if (kind === "clone_pattern") {
       const iid = Number(args["source_iid"]);
       const newName = args["name"];
