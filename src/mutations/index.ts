@@ -1032,6 +1032,96 @@ export function setTrackColor(
 }
 
 // --------------------------------------------------------------------------- //
+// setTrackGrouped — toggle "grouped with track above" flag (byte 47)
+// --------------------------------------------------------------------------- //
+
+/**
+ * Toggle the `grouped` flag at byte 47 of the 70-byte `0xEE`
+ * track-data blob. FL infers parent/child track grouping positionally:
+ * track N is a CHILD of the nearest track at index <N with
+ * `grouped == false`. So setting `grouped: true` on track 5 makes it
+ * a child of whatever ungrouped track sits at index 4 or earlier.
+ */
+export function setTrackGrouped(
+  project: FLPProject,
+  arrangementId: number,
+  trackIndex: number,
+  grouped: boolean,
+): FLPProject {
+  if (!Number.isInteger(arrangementId) || arrangementId < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `arrangement id must be a non-negative integer, got ${arrangementId}`,
+    );
+  }
+  if (!Number.isInteger(trackIndex) || trackIndex < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `track index must be a non-negative integer, got ${trackIndex}`,
+    );
+  }
+  if (typeof grouped !== "boolean") {
+    throw new MutationError("INVALID_ARGS", "grouped must be a boolean");
+  }
+  const events = [...project.events];
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind === "u16" &&
+      ev.opcode === OP_ARRANGEMENT_NEW &&
+      ev.value === arrangementId
+    ) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no arrangement with id=${arrangementId} found`,
+    );
+  }
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) {
+      endIndex = i;
+      break;
+    }
+  }
+  let trackBlobIdx = -1;
+  let seen = -1;
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_TRACK_DATA) {
+      seen += 1;
+      if (seen === trackIndex) {
+        trackBlobIdx = i;
+        break;
+      }
+    }
+  }
+  if (trackBlobIdx === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `arrangement ${arrangementId} has no track at index ${trackIndex} (only ${seen + 1} tracks)`,
+    );
+  }
+  const orig = events[trackBlobIdx]!;
+  if (orig.kind !== "blob" || orig.payload.byteLength < 48) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `track-data blob too small for grouped flag (${orig.kind === "blob" ? orig.payload.byteLength : 0} bytes; need >= 48)`,
+    );
+  }
+  const newPayload = new Uint8Array(orig.payload);
+  newPayload[47] = grouped ? 1 : 0;
+  events[trackBlobIdx] = { kind: "blob", opcode: OP_TRACK_DATA, payload: newPayload };
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
 // addClip / removeClip / moveClip — playlist clip mutations
 // --------------------------------------------------------------------------- //
 

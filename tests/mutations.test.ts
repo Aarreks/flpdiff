@@ -16,6 +16,7 @@ import {
   setArrangementName,
   setTrackName,
   setTrackColor,
+  setTrackGrouped,
   clonePattern,
   addClip,
   removeClip,
@@ -434,6 +435,34 @@ describe("setTrackColor", () => {
   test("EVENT_NOT_FOUND for missing track", () => {
     const project = loadProject(FIXTURE);
     expect(() => setTrackColor(project, 0, 99999, { r: 0, g: 0, b: 0 })).toThrow(MutationError);
+  });
+});
+
+describe("setTrackGrouped", () => {
+  test("toggles the grouped flag (round-trip via 0xEE byte 47)", () => {
+    const project = loadProject(FIXTURE);
+    const m = setTrackGrouped(project, 0, 1, true);
+    const re = reparse(m);
+    const channels = buildChannels(re.events, re.metadata);
+    const arrs = buildArrangements(re.events, channels, re.patterns, re.metadata);
+    expect(arrs[0]?.tracks[1]?.grouped).toBe(true);
+  });
+
+  test("can ungroup", () => {
+    const project = loadProject(FIXTURE);
+    const m1 = setTrackGrouped(project, 0, 2, true);
+    const m2 = setTrackGrouped(m1, 0, 2, false);
+    const re = reparse(m2);
+    const channels = buildChannels(re.events, re.metadata);
+    const arrs = buildArrangements(re.events, channels, re.patterns, re.metadata);
+    expect(arrs[0]?.tracks[2]?.grouped === true).toBe(false);
+  });
+
+  test("rejects non-boolean", () => {
+    const project = loadProject(FIXTURE);
+    expect(() =>
+      setTrackGrouped(project, 0, 0, "yes" as unknown as boolean),
+    ).toThrow(MutationError);
   });
 });
 

@@ -117,6 +117,16 @@ export type Track = {
   height?: number;
   /** Track-locked flag from blob byte 48 (u8 bool). */
   locked?: boolean;
+  /**
+   * "Grouped with track above" flag from blob byte 47 (u8 bool).
+   *
+   * FL implements track grouping (parent/child collapsible tracks)
+   * positionally: track N is a child of the nearest track at index <N
+   * with `grouped == false`. So the parent inference is just "walk
+   * up until you find an ungrouped track". A track at index 0 is
+   * always a parent regardless of its flag.
+   */
+  grouped?: boolean;
 };
 
 /**
@@ -146,6 +156,9 @@ export function decodeTrackData(payload: Uint8Array, index: number): Track {
   if (payload.byteLength >= 12) track.icon = view.getUint32(8, true);
   if (payload.byteLength >= 13) track.enabled = view.getUint8(12) !== 0;
   if (payload.byteLength >= 17) track.height = view.getFloat32(13, true);
+  // Per PyFLP TrackEvent struct: byte 47 = grouped (1-byte bool),
+  // byte 48 = locked. Earlier FL builds may stop short of byte 47.
+  if (payload.byteLength >= 48) track.grouped = view.getUint8(47) !== 0;
   if (payload.byteLength >= 49) track.locked = view.getUint8(48) !== 0;
   return track;
 }

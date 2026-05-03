@@ -53,6 +53,7 @@ import {
   setArrangementName,
   setTrackName,
   setTrackColor,
+  setTrackGrouped,
   clonePattern,
   addClip,
   removeClip,
@@ -108,6 +109,7 @@ const WRITE_KINDS = new Set([
   "set_arrangement_name",
   "set_track_name",
   "set_track_color",
+  "set_track_grouped",
   "clone_pattern",
   "add_clip",
   "remove_clip",
@@ -182,6 +184,116 @@ function parseRGBAArg(args: Record<string, unknown>): RGBA {
     throw new MutationError("INVALID_ARGS", "args.color components must be numeric");
   }
   return { r, g, b, a };
+}
+
+// Per-kind allowed-args table. `path` is implicit on every kind that
+// requires loading a file. Aliases get renamed to the canonical name
+// during normalisation; anything else is rejected.
+const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
+  // reads
+  describe: new Set(["path"]),
+  get_tempo: new Set(["path"]),
+  list_channels: new Set(["path"]),
+  list_mixer: new Set(["path"]),
+  list_patterns: new Set(["path"]),
+  list_plugins: new Set(["path"]),
+  list_arrangements: new Set(["path"]),
+  list_tracks: new Set(["path", "arrangement"]),
+  list_clips: new Set(["path", "arrangement"]),
+  // writes
+  set_tempo: new Set(["path", "bpm"]),
+  set_pattern_name: new Set(["path", "iid", "name"]),
+  set_channel_name: new Set(["path", "iid", "name"]),
+  set_insert_name: new Set(["path", "index", "name"]),
+  set_time_signature: new Set(["path", "numerator", "denominator"]),
+  set_channel_color: new Set(["path", "iid", "color"]),
+  set_insert_color: new Set(["path", "index", "color"]),
+  set_pattern_color: new Set(["path", "iid", "color"]),
+  set_channel_routing: new Set(["path", "iid", "target_insert"]),
+  set_arrangement_name: new Set(["path", "id", "name"]),
+  set_track_name: new Set(["path", "arrangement", "track", "name"]),
+  set_track_color: new Set(["path", "arrangement", "track", "color"]),
+  set_track_grouped: new Set(["path", "arrangement", "track", "grouped"]),
+  clone_pattern: new Set(["path", "source_iid", "name"]),
+  add_clip: new Set([
+    "path",
+    "arrangement",
+    "kind",
+    "ref_id",
+    "track_index",
+    "position_ticks",
+    "length_ticks",
+  ]),
+  remove_clip: new Set([
+    "path",
+    "arrangement",
+    "track_index",
+    "position_ticks",
+    "ref_id",
+    "kind",
+  ]),
+  move_clip: new Set([
+    "path",
+    "arrangement",
+    "track_index",
+    "position_ticks",
+    "ref_id",
+    "kind",
+    "to_track_index",
+    "to_position_ticks",
+  ]),
+};
+
+// Common LLM-natural aliases → canonical arg name. Applied per-kind
+// AFTER unknown-key check, so `arrangement_id: 6` becomes `arrangement: 6`
+// rather than being silently dropped.
+const ARG_ALIASES: Record<string, string> = {
+  arrangement_id: "arrangement",
+  arrangementId: "arrangement",
+  track_id: "track",
+  trackId: "track",
+  channel_iid: "iid",
+  channelIid: "iid",
+  pattern_iid: "iid",
+  patternIid: "iid",
+  insert_idx: "index",
+  insertIdx: "index",
+  insert_index: "index",
+  insertIndex: "index",
+  arrangement_name: "name",
+  bpm_value: "bpm",
+};
+
+function normaliseArgs(
+  kind: string,
+  rawArgs: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!rawArgs) return {};
+  const allowed = ALLOWED_ARGS[kind];
+  if (!allowed) return rawArgs; // unknown kind — let dispatcher handle
+  const out: Record<string, unknown> = {};
+  const unknown: string[] = [];
+  for (const [key, value] of Object.entries(rawArgs)) {
+    const canonical = ARG_ALIASES[key] ?? key;
+    if (!allowed.has(canonical)) {
+      unknown.push(key);
+      continue;
+    }
+    if (canonical in out) {
+      throw new BridgeError(
+        "INVALID_ARGS",
+        `args.${canonical} supplied twice (also via alias '${key}')`,
+      );
+    }
+    out[canonical] = value;
+  }
+  if (unknown.length > 0) {
+    throw new BridgeError(
+      "INVALID_ARGS",
+      `unknown args for ${kind}: ${unknown.join(", ")}; allowed: ${[...allowed].sort().join(", ")}`,
+    );
+  }
+  return out;
 }
 
 function readStdinSync(): string {
@@ -371,6 +483,20 @@ function executeWrite(
         to.position_ticks = p;
       }
       mutated = moveClip(project, arrId, parseMatchArg(args), to);
+    } else if (kind === "set_track_grouped") {
+      const arrId = Number(args["arrangement"] ?? 0);
+      const trackIdx = Number(args["track"]);
+      const grouped = args["grouped"];
+      if (!Number.isFinite(arrId)) {
+        throw new MutationError("INVALID_ARGS", "args.arrangement must be a non-negative integer");
+      }
+      if (!Number.isFinite(trackIdx)) {
+        throw new MutationError("INVALID_ARGS", "args.track is required (non-negative integer)");
+      }
+      if (typeof grouped !== "boolean") {
+        throw new MutationError("INVALID_ARGS", "args.grouped is required (boolean)");
+      }
+      mutated = setTrackGrouped(project, arrId, trackIdx, grouped);
     } else if (kind === "clone_pattern") {
       const iid = Number(args["source_iid"]);
       const newName = args["name"];
@@ -423,7 +549,7 @@ function requirePath(args: Record<string, unknown> | undefined): string {
 }
 
 function execute(req: BridgeRequest): BridgeResponse {
-  const { kind, args } = req;
+  const { kind, args: rawArgs } = req;
 
   if (!READ_KINDS.has(kind) && !WRITE_KINDS.has(kind)) {
     const all = [...READ_KINDS, ...WRITE_KINDS].sort();
@@ -435,12 +561,27 @@ function execute(req: BridgeRequest): BridgeResponse {
     };
   }
 
+  let args: Record<string, unknown>;
+  try {
+    args = normaliseArgs(kind, rawArgs);
+  } catch (err) {
+    if (err instanceof BridgeError) {
+      return { ok: false, kind, error: err.code, message: err.message };
+    }
+    return {
+      ok: false,
+      kind,
+      error: "UNKNOWN",
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+
   try {
     const path = requirePath(args);
     const project = loadProject(path);
 
     if (WRITE_KINDS.has(kind)) {
-      return executeWrite(kind, args!, path, project);
+      return executeWrite(kind, args, path, project);
     }
 
     switch (kind) {
@@ -525,7 +666,7 @@ function execute(req: BridgeRequest): BridgeResponse {
       }
 
       case "list_tracks": {
-        const arrIdx = Number((args!["arrangement"] ?? 0) as unknown);
+        const arrIdx = Number((args["arrangement"] ?? 0) as unknown);
         const channels = buildChannels(project.events, project.metadata);
         const patterns = buildPatterns(project.events, project.metadata);
         const arrs = buildArrangements(project.events, channels, patterns, project.metadata);
@@ -538,34 +679,51 @@ function execute(req: BridgeRequest): BridgeResponse {
           };
         }
         // Filter to user-customised tracks only — tracks with a name
-        // OR locked OR disabled. FL emits 500 default tracks per
-        // arrangement, all with the same default color + enabled=true,
-        // so color/enable alone are not user-customisation signals.
+        // OR locked OR disabled OR grouped (group children are
+        // user-set even on tracks left otherwise default). FL emits
+        // 500 default tracks per arrangement.
         const all = arrs[arrIdx]!.tracks;
         const named = all.filter(
-          (t) => t.name !== undefined || t.locked === true || t.enabled === false,
+          (t) =>
+            t.name !== undefined ||
+            t.locked === true ||
+            t.enabled === false ||
+            t.grouped === true,
         );
+        // Compute parent track per index: the nearest earlier track
+        // with grouped=false. Track 0 is always its own parent.
+        const parentByIndex = new Map<number, number>();
+        let lastParent = 0;
+        for (const t of all) {
+          if (t.grouped !== true || t.index === 0) lastParent = t.index;
+          parentByIndex.set(t.index, lastParent);
+        }
         return {
           ok: true,
           kind,
           result: {
             arrangement: arrIdx,
             total_tracks: all.length,
-            tracks: named.map((t) => ({
-              index: t.index,
-              iid: t.iid,
-              name: t.name ?? null,
-              color: t.color ?? null,
-              enabled: t.enabled ?? null,
-              locked: t.locked ?? null,
-              height: t.height ?? null,
-            })),
+            tracks: named.map((t) => {
+              const parent = parentByIndex.get(t.index)!;
+              return {
+                index: t.index,
+                iid: t.iid,
+                name: t.name ?? null,
+                color: t.color ?? null,
+                enabled: t.enabled ?? null,
+                locked: t.locked ?? null,
+                height: t.height ?? null,
+                grouped: t.grouped ?? false,
+                parent_index: parent === t.index ? null : parent,
+              };
+            }),
           },
         };
       }
 
       case "list_clips": {
-        const arrIdx = Number((args!["arrangement"] ?? 0) as unknown);
+        const arrIdx = Number((args["arrangement"] ?? 0) as unknown);
         const channels = buildChannels(project.events, project.metadata);
         const patterns = buildPatterns(project.events, project.metadata);
         const arrs = buildArrangements(project.events, channels, patterns, project.metadata);
