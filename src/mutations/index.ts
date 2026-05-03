@@ -38,6 +38,15 @@ const OP_CHANNEL_COLOR = 0x80; // u32 RGBA in channel scope (shared with plugin 
 const OP_INSERT_COLOR = 0x95; // u32 RGBA in mixer-insert scope
 const OP_PATTERN_COLOR = 0x96; // u32 RGBA in pattern scope
 const OP_CHANNEL_ROUTED_TO = 0x16; // u8 (signed int8) in channel scope; -1 = unrouted
+const OP_ARRANGEMENT_NEW = 0x63; // u16 arrangement id (opens arrangement scope)
+const OP_ARRANGEMENT_NAME = 0xf1; // UTF-16LE arrangement name
+const OP_TRACK_DATA = 0xee; // 70-byte blob; one per track in arrangement
+const OP_TRACK_NAME = 0xef; // UTF-16LE per-track name (follows the 0xEE it names)
+const OP_PATTERN_NOTES = 0xe0; // pattern note blob (FL 25; pre-FL-25 was 0xD0)
+const OP_PATTERN_CONTROLLERS = 0xdf; // pattern controllers blob
+const OP_PATTERN_COLOR_OPCODE = 0x96; // alias for clarity in pattern-clone code
+const OP_PATTERN_LENGTH = 0xa4; // u32 pattern length in PPQ ticks
+const OP_PATTERN_LOOPED = 0x1a; // u8 looped flag
 
 export type RGBA = { r: number; g: number; b: number; a?: number };
 
@@ -646,6 +655,285 @@ export function setChannelRouting(
     opcode: OP_CHANNEL_ROUTED_TO,
     value: encoded,
   });
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
+// setArrangementName
+// --------------------------------------------------------------------------- //
+
+export function setArrangementName(
+  project: FLPProject,
+  arrangementId: number,
+  name: string,
+): FLPProject {
+  if (!Number.isInteger(arrangementId) || arrangementId < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `arrangement id must be a non-negative integer, got ${arrangementId}`,
+    );
+  }
+  if (typeof name !== "string" || name.length === 0) {
+    throw new MutationError("INVALID_ARGS", "name must be a non-empty string");
+  }
+  const events = [...project.events];
+  const newPayload = encodeUtf16LeNullTerminated(name);
+
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind === "u16" &&
+      ev.opcode === OP_ARRANGEMENT_NEW &&
+      ev.value === arrangementId
+    ) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no arrangement with id=${arrangementId} found`,
+    );
+  }
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) {
+      endIndex = i;
+      break;
+    }
+  }
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_ARRANGEMENT_NAME) {
+      events[i] = { kind: "blob", opcode: OP_ARRANGEMENT_NAME, payload: newPayload };
+      return { ...project, events };
+    }
+  }
+  events.splice(openIndex + 1, 0, {
+    kind: "blob",
+    opcode: OP_ARRANGEMENT_NAME,
+    payload: newPayload,
+  });
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
+// setTrackName
+// --------------------------------------------------------------------------- //
+
+/**
+ * Replace the per-track name (`0xEF`) on track `trackIndex` (0-based,
+ * 0 = top) within arrangement `arrangementId`. Track-data blobs (`0xEE`)
+ * appear in walker order; the Nth `0xEE` after the arrangement opener
+ * is track N. Track names appear immediately AFTER the `0xEE` they
+ * label — FL only emits `0xEF` when the user has set a custom name,
+ * so absence is normal.
+ */
+export function setTrackName(
+  project: FLPProject,
+  arrangementId: number,
+  trackIndex: number,
+  name: string,
+): FLPProject {
+  if (!Number.isInteger(arrangementId) || arrangementId < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `arrangement id must be a non-negative integer, got ${arrangementId}`,
+    );
+  }
+  if (!Number.isInteger(trackIndex) || trackIndex < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `track index must be a non-negative integer, got ${trackIndex}`,
+    );
+  }
+  if (typeof name !== "string" || name.length === 0) {
+    throw new MutationError("INVALID_ARGS", "name must be a non-empty string");
+  }
+  const events = [...project.events];
+  const newPayload = encodeUtf16LeNullTerminated(name);
+
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind === "u16" &&
+      ev.opcode === OP_ARRANGEMENT_NEW &&
+      ev.value === arrangementId
+    ) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no arrangement with id=${arrangementId} found`,
+    );
+  }
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) {
+      endIndex = i;
+      break;
+    }
+  }
+
+  // Walk to the (trackIndex)-th 0xEE in the arrangement scope.
+  let trackBlobIdx = -1;
+  let seen = -1;
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_TRACK_DATA) {
+      seen += 1;
+      if (seen === trackIndex) {
+        trackBlobIdx = i;
+        break;
+      }
+    }
+  }
+  if (trackBlobIdx === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `arrangement ${arrangementId} has no track at index ${trackIndex} (only ${seen + 1} tracks)`,
+    );
+  }
+
+  // Look for an existing 0xEF immediately after the 0xEE — but only
+  // BEFORE the next 0xEE (so we don't accidentally rename a different track).
+  let nextTrackIdx = endIndex;
+  for (let i = trackBlobIdx + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_TRACK_DATA) {
+      nextTrackIdx = i;
+      break;
+    }
+  }
+  for (let i = trackBlobIdx + 1; i < nextTrackIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_TRACK_NAME) {
+      events[i] = { kind: "blob", opcode: OP_TRACK_NAME, payload: newPayload };
+      return { ...project, events };
+    }
+  }
+  events.splice(trackBlobIdx + 1, 0, {
+    kind: "blob",
+    opcode: OP_TRACK_NAME,
+    payload: newPayload,
+  });
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
+// clonePattern
+// --------------------------------------------------------------------------- //
+
+/**
+ * Clone pattern `sourceIid` to a new pattern with id = (max existing
+ * pattern id) + 1. Duplicates the pattern's full event subtree (notes,
+ * controllers, color, length, looped flag, and any 0xC1 name) and
+ * inserts after the source pattern's events. The new pattern's `0x41`
+ * marker carries the new id, and the optional `newName` (default
+ * "<source name> copy") replaces the cloned 0xC1 blob.
+ *
+ * FL emits 0x41 TWICE per pattern (once for note/controller events,
+ * once for the rest). We dedupe by walking from the FIRST 0x41 with
+ * sourceIid until we exit the pattern's scope — bounded by the next
+ * 0x41 with a DIFFERENT id OR end-of-pattern-section.
+ */
+export function clonePattern(
+  project: FLPProject,
+  sourceIid: number,
+  newName?: string,
+): FLPProject {
+  if (!Number.isInteger(sourceIid) || sourceIid < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern iid must be a positive integer (1-based), got ${sourceIid}`,
+    );
+  }
+
+  // Find max pattern id to assign the new one.
+  let maxId = 0;
+  let sawSource = false;
+  for (const ev of project.events) {
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW) {
+      if (ev.value > maxId) maxId = ev.value;
+      if (ev.value === sourceIid) sawSource = true;
+    }
+  }
+  if (!sawSource) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with iid=${sourceIid} found`);
+  }
+  const newId = maxId + 1;
+
+  // Pattern-scope opcode whitelist — mirrors buildPatterns. We
+  // intentionally do NOT blanket-capture every event after a 0x41,
+  // because the pattern section has no closing marker; everything
+  // until the next 0x41 OR the start of the arrangement section
+  // (0x63) would otherwise leak into the clone.
+  const PATTERN_SCOPE_OPCODES: ReadonlySet<number> = new Set([
+    OP_PATTERN_NAME,
+    OP_PATTERN_NOTES,
+    OP_PATTERN_CONTROLLERS,
+    OP_PATTERN_COLOR_OPCODE,
+    OP_PATTERN_LENGTH,
+    OP_PATTERN_LOOPED,
+  ]);
+  const cloned: FLPEvent[] = [];
+  let scopeId = -1;
+  let lastSourceIdx = -1;
+  for (let i = 0; i < project.events.length; i++) {
+    const ev = project.events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW) {
+      scopeId = ev.value;
+      if (scopeId === sourceIid) {
+        cloned.push({ kind: "u16", opcode: OP_PATTERN_NEW, value: newId });
+        lastSourceIdx = i;
+      }
+      continue;
+    }
+    if (scopeId !== sourceIid) continue;
+    if (!PATTERN_SCOPE_OPCODES.has(ev.opcode)) continue;
+    lastSourceIdx = i;
+    if (ev.kind === "blob" && ev.opcode === OP_PATTERN_NAME) {
+      const finalName = newName ?? `Pattern ${sourceIid} copy`;
+      cloned.push({
+        kind: "blob",
+        opcode: OP_PATTERN_NAME,
+        payload: encodeUtf16LeNullTerminated(finalName),
+      });
+      continue;
+    }
+    if (ev.kind === "blob") {
+      cloned.push({ kind: "blob", opcode: ev.opcode, payload: new Uint8Array(ev.payload) });
+    } else if (ev.kind === "u8") {
+      cloned.push({ kind: "u8", opcode: ev.opcode, value: ev.value });
+    } else if (ev.kind === "u16") {
+      cloned.push({ kind: "u16", opcode: ev.opcode, value: ev.value });
+    } else if (ev.kind === "u32") {
+      cloned.push({ kind: "u32", opcode: ev.opcode, value: ev.value });
+    }
+  }
+
+  // If source has no 0xC1 name event, insert one for the clone right
+  // after its 0x41 so the rename is visible.
+  const cloneHasName = cloned.some((e) => e.kind === "blob" && e.opcode === OP_PATTERN_NAME);
+  if (!cloneHasName) {
+    const finalName = newName ?? `Pattern ${sourceIid} copy`;
+    cloned.splice(1, 0, {
+      kind: "blob",
+      opcode: OP_PATTERN_NAME,
+      payload: encodeUtf16LeNullTerminated(finalName),
+    });
+  }
+
+  const events = [...project.events];
+  events.splice(lastSourceIdx + 1, 0, ...cloned);
   return { ...project, events };
 }
 

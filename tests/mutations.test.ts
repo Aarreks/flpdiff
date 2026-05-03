@@ -13,8 +13,12 @@ import {
   setInsertColor,
   setPatternColor,
   setChannelRouting,
+  setArrangementName,
+  setTrackName,
+  clonePattern,
   MutationError,
 } from "../src/mutations/index.ts";
+import { buildArrangements } from "../src/parser/project-builder.ts";
 import { buildProjectSummary } from "../src/summary.ts";
 import { buildChannels } from "../src/parser/project-builder.ts";
 
@@ -325,6 +329,110 @@ describe("setChannelRouting", () => {
     const project = loadProject(FIXTURE);
     expect(() => setChannelRouting(project, 0, 128)).toThrow(MutationError);
     expect(() => setChannelRouting(project, 0, -2)).toThrow(MutationError);
+  });
+});
+
+describe("setArrangementName", () => {
+  test("renames the default arrangement", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setArrangementName(project, 0, "Verse-A");
+    const reparsed = reparse(mutated);
+    const channels = buildChannels(reparsed.events, reparsed.metadata);
+    const arrs = buildArrangements(
+      reparsed.events,
+      channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    );
+    expect(arrs[0]?.name).toBe("Verse-A");
+  });
+
+  test("EVENT_NOT_FOUND for missing arrangement", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setArrangementName(project, 99, "x")).toThrow(MutationError);
+  });
+
+  test("rejects empty name", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setArrangementName(project, 0, "")).toThrow(MutationError);
+  });
+});
+
+describe("setTrackName", () => {
+  test("names a previously-unnamed track", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setTrackName(project, 0, 0, "Drums");
+    const reparsed = reparse(mutated);
+    const channels = buildChannels(reparsed.events, reparsed.metadata);
+    const arrs = buildArrangements(
+      reparsed.events,
+      channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    );
+    expect(arrs[0]?.tracks[0]?.name).toBe("Drums");
+  });
+
+  test("renames different tracks independently", () => {
+    let project = loadProject(FIXTURE);
+    project = setTrackName(project, 0, 2, "Bass");
+    project = setTrackName(project, 0, 5, "Lead");
+    const reparsed = reparse(project);
+    const channels = buildChannels(reparsed.events, reparsed.metadata);
+    const arrs = buildArrangements(
+      reparsed.events,
+      channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    );
+    expect(arrs[0]?.tracks[2]?.name).toBe("Bass");
+    expect(arrs[0]?.tracks[5]?.name).toBe("Lead");
+    expect(arrs[0]?.tracks[0]?.name).toBeUndefined();
+  });
+
+  test("EVENT_NOT_FOUND for out-of-range track index", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setTrackName(project, 0, 999_999, "x")).toThrow(MutationError);
+  });
+});
+
+describe("clonePattern", () => {
+  test("duplicates an existing pattern with new id + name", () => {
+    const project = loadProject(FIXTURE);
+    const before = project.patterns.length;
+    const mutated = clonePattern(project, 1, "Verse-Copy");
+    const reparsed = reparse(mutated);
+    expect(reparsed.patterns.length).toBe(before + 1);
+    const clone = reparsed.patterns.find((p) => p.name === "Verse-Copy");
+    expect(clone).toBeDefined();
+    expect(clone?.id).toBeGreaterThan(1);
+  });
+
+  test("default name when newName omitted", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = clonePattern(project, 1);
+    const reparsed = reparse(mutated);
+    const clone = reparsed.patterns.find((p) => p.id !== 1 && (p.name ?? "").includes("copy"));
+    expect(clone).toBeDefined();
+  });
+
+  test("clone has same notes as source", () => {
+    const project = loadProject(FIXTURE);
+    const src = project.patterns.find((p) => p.id === 1)!;
+    const mutated = clonePattern(project, 1, "Twin");
+    const reparsed = reparse(mutated);
+    const clone = reparsed.patterns.find((p) => p.name === "Twin");
+    expect(clone?.notes.length).toBe(src.notes.length);
+  });
+
+  test("EVENT_NOT_FOUND for missing source iid", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => clonePattern(project, 9999)).toThrow(MutationError);
+  });
+
+  test("rejects iid < 1", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => clonePattern(project, 0)).toThrow(MutationError);
   });
 });
 

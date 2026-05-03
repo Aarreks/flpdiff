@@ -50,6 +50,9 @@ import {
   setInsertColor,
   setPatternColor,
   setChannelRouting,
+  setArrangementName,
+  setTrackName,
+  clonePattern,
   MutationError,
   type RGBA,
 } from "./mutations/index.ts";
@@ -96,6 +99,9 @@ const WRITE_KINDS = new Set([
   "set_insert_color",
   "set_pattern_color",
   "set_channel_routing",
+  "set_arrangement_name",
+  "set_track_name",
+  "clone_pattern",
 ]);
 
 function parseRGBAArg(args: Record<string, unknown>): RGBA {
@@ -235,6 +241,40 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "args.target_insert is required (-1 or 0..127)");
       }
       mutated = setChannelRouting(project, iid, target);
+    } else if (kind === "set_arrangement_name") {
+      const id = Number(args["id"] ?? 0);
+      const name = args["name"];
+      if (!Number.isFinite(id)) {
+        throw new MutationError("INVALID_ARGS", "args.id must be a non-negative integer");
+      }
+      if (typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name is required (string)");
+      }
+      mutated = setArrangementName(project, id, name);
+    } else if (kind === "set_track_name") {
+      const arrId = Number(args["arrangement"] ?? 0);
+      const trackIdx = Number(args["track"]);
+      const name = args["name"];
+      if (!Number.isFinite(arrId)) {
+        throw new MutationError("INVALID_ARGS", "args.arrangement must be a non-negative integer");
+      }
+      if (!Number.isFinite(trackIdx)) {
+        throw new MutationError("INVALID_ARGS", "args.track is required (non-negative integer)");
+      }
+      if (typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name is required (string)");
+      }
+      mutated = setTrackName(project, arrId, trackIdx, name);
+    } else if (kind === "clone_pattern") {
+      const iid = Number(args["source_iid"]);
+      const newName = args["name"];
+      if (!Number.isFinite(iid)) {
+        throw new MutationError("INVALID_ARGS", "args.source_iid is required (positive integer)");
+      }
+      if (newName !== undefined && typeof newName !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name must be a string when provided");
+      }
+      mutated = clonePattern(project, iid, newName);
     } else {
       return {
         ok: false,
