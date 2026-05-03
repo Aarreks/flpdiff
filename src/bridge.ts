@@ -36,6 +36,11 @@ import { serializeFLPProject } from "./parser/flp-write.ts";
 import { buildProjectSummary } from "./summary.ts";
 import { toFlpInfoJson } from "./presentation/flp-info.ts";
 import {
+  buildArrangements,
+  buildChannels,
+  buildPatterns,
+} from "./parser/project-builder.ts";
+import {
   setTempo,
   setPatternName,
   setChannelName,
@@ -76,6 +81,9 @@ const READ_KINDS = new Set([
   "list_mixer",
   "list_patterns",
   "list_plugins",
+  "list_arrangements",
+  "list_tracks",
+  "list_clips",
 ]);
 
 const WRITE_KINDS = new Set([
@@ -351,6 +359,97 @@ function execute(req: BridgeRequest): BridgeResponse {
           }
         }
         return { ok: true, kind, result: plugins };
+      }
+
+      case "list_arrangements": {
+        const channels = buildChannels(project.events, project.metadata);
+        const patterns = buildPatterns(project.events, project.metadata);
+        const arrs = buildArrangements(project.events, channels, patterns, project.metadata);
+        return {
+          ok: true,
+          kind,
+          result: arrs.map((a) => ({
+            id: a.id,
+            name: a.name ?? null,
+            track_count: a.tracks.length,
+            clip_count: a.clips.length,
+            timemarker_count: a.timemarkers.length,
+          })),
+        };
+      }
+
+      case "list_tracks": {
+        const arrIdx = Number((args!["arrangement"] ?? 0) as unknown);
+        const channels = buildChannels(project.events, project.metadata);
+        const patterns = buildPatterns(project.events, project.metadata);
+        const arrs = buildArrangements(project.events, channels, patterns, project.metadata);
+        if (!Number.isInteger(arrIdx) || arrIdx < 0 || arrIdx >= arrs.length) {
+          return {
+            ok: false,
+            kind,
+            error: "INVALID_ARGS",
+            message: `args.arrangement out of range; project has ${arrs.length} arrangement(s)`,
+          };
+        }
+        // Filter to user-customised tracks only — tracks with a name
+        // OR locked OR disabled. FL emits 500 default tracks per
+        // arrangement, all with the same default color + enabled=true,
+        // so color/enable alone are not user-customisation signals.
+        const all = arrs[arrIdx]!.tracks;
+        const named = all.filter(
+          (t) => t.name !== undefined || t.locked === true || t.enabled === false,
+        );
+        return {
+          ok: true,
+          kind,
+          result: {
+            arrangement: arrIdx,
+            total_tracks: all.length,
+            tracks: named.map((t) => ({
+              index: t.index,
+              iid: t.iid,
+              name: t.name ?? null,
+              color: t.color ?? null,
+              enabled: t.enabled ?? null,
+              locked: t.locked ?? null,
+              height: t.height ?? null,
+            })),
+          },
+        };
+      }
+
+      case "list_clips": {
+        const arrIdx = Number((args!["arrangement"] ?? 0) as unknown);
+        const channels = buildChannels(project.events, project.metadata);
+        const patterns = buildPatterns(project.events, project.metadata);
+        const arrs = buildArrangements(project.events, channels, patterns, project.metadata);
+        if (!Number.isInteger(arrIdx) || arrIdx < 0 || arrIdx >= arrs.length) {
+          return {
+            ok: false,
+            kind,
+            error: "INVALID_ARGS",
+            message: `args.arrangement out of range; project has ${arrs.length} arrangement(s)`,
+          };
+        }
+        const PATTERN_BASE = 20480;
+        const TRACK_MAX = 499;
+        return {
+          ok: true,
+          kind,
+          result: arrs[arrIdx]!.clips.map((c) => {
+            const isPattern = c.item_index > PATTERN_BASE;
+            return {
+              position_ticks: c.position,
+              length_ticks: c.length,
+              // Un-reverse track index so 0 = top track in FL's display.
+              track_index: TRACK_MAX - c.track_rvidx,
+              kind: isPattern ? "pattern" : "channel",
+              ref_id: isPattern ? c.item_index - PATTERN_BASE : c.item_index,
+              group: c.group,
+              flags: c.item_flags,
+            };
+          }),
+        };
       }
     }
     return {
