@@ -37,7 +37,13 @@ export {
 export type { Pattern, Note, Controller } from "./model/pattern.ts";
 export { formatPatternSummary, decodeNotes, decodeControllers } from "./model/pattern.ts";
 export type { Arrangement, Clip, TimeMarker, TimeMarkerKind } from "./model/arrangement.ts";
-export { formatArrangementSummary, decodeClips, decodeTimeMarkerPosition } from "./model/arrangement.ts";
+export {
+  formatArrangementSummary,
+  decodeClips,
+  decodeTimeMarkerPosition,
+  decodeTrackData,
+} from "./model/arrangement.ts";
+export type { Track } from "./model/arrangement.ts";
 export type {
   ProjectSummary,
   ChannelSummary,

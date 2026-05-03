@@ -5,8 +5,11 @@ import {
   formatArrangementSummary,
   decodeClips,
   decodeTimeMarkerPosition,
+  decodeTrackData,
   type Arrangement,
 } from "../src/index.ts";
+import { setTrackGrouped, setTrackName } from "../src/mutations/index.ts";
+import { serializeFLPProject } from "../src/parser/flp-write.ts";
 
 const CORPUS_DIR = resolve(import.meta.dir, "./corpus/re_base/fl25");
 
@@ -141,5 +144,144 @@ describe("decodeClips — binary-format unit tests (crafted payloads)", () => {
     expect(clips.length).toBe(2);
     expect(clips[0]!.position).toBe(0);
     expect(clips[1]!.position).toBe(480);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Track grouping (parent/child) — regression for the FL collapsible
+// track hierarchy that was previously invisible to the parser.
+// --------------------------------------------------------------------------- //
+
+describe("decodeTrackData — grouped flag (byte 47)", () => {
+  function makeTrackBlob(opts: {
+    iid?: number;
+    color?: number;
+    grouped?: boolean;
+    locked?: boolean;
+  }): Uint8Array {
+    // 70-byte FL 25 layout. Only the fields we care about are set;
+    // everything else stays zero.
+    const buf = new Uint8Array(70);
+    const view = new DataView(buf.buffer);
+    if (opts.iid !== undefined) view.setUint32(0, opts.iid, true);
+    if (opts.color !== undefined) view.setUint32(4, opts.color, true);
+    if (opts.grouped !== undefined) view.setUint8(47, opts.grouped ? 1 : 0);
+    if (opts.locked !== undefined) view.setUint8(48, opts.locked ? 1 : 0);
+    return buf;
+  }
+
+  test("byte 47 = 0 → grouped: false", () => {
+    const blob = makeTrackBlob({ iid: 42, grouped: false });
+    const t = decodeTrackData(blob, 5);
+    expect(t.index).toBe(5);
+    expect(t.iid).toBe(42);
+    expect(t.grouped).toBe(false);
+  });
+
+  test("byte 47 = 1 → grouped: true", () => {
+    const blob = makeTrackBlob({ iid: 7, grouped: true });
+    const t = decodeTrackData(blob, 9);
+    expect(t.grouped).toBe(true);
+  });
+
+  test("grouped is independent of locked (byte 47 vs 48)", () => {
+    expect(decodeTrackData(makeTrackBlob({ grouped: true, locked: false }), 0).grouped).toBe(true);
+    expect(decodeTrackData(makeTrackBlob({ grouped: true, locked: false }), 0).locked).toBe(false);
+    expect(decodeTrackData(makeTrackBlob({ grouped: false, locked: true }), 0).grouped).toBe(false);
+    expect(decodeTrackData(makeTrackBlob({ grouped: false, locked: true }), 0).locked).toBe(true);
+  });
+
+  test("payload shorter than 48 bytes → grouped undefined (don't read past end)", () => {
+    const short = new Uint8Array(40);
+    const t = decodeTrackData(short, 0);
+    expect(t.grouped).toBeUndefined();
+  });
+
+  test("default 70-byte all-zero blob → grouped: false (FL emits this on every untouched track)", () => {
+    const t = decodeTrackData(new Uint8Array(70), 0);
+    expect(t.grouped).toBe(false);
+  });
+});
+
+describe("setTrackGrouped — round-trip preserves all other track-data bytes", () => {
+  const FIX = resolve(CORPUS_DIR, "base_one_pattern.flp");
+
+  async function loadProject() {
+    const buf = await Bun.file(FIX).arrayBuffer();
+    return parseFLPFile(buf);
+  }
+
+  function reparse(project: ReturnType<typeof parseFLPFile>) {
+    const bytes = serializeFLPProject(project);
+    return parseFLPFile(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+  }
+
+  test("setTrackGrouped → serialize → parse → grouped survives", async () => {
+    const project = await loadProject();
+    const m = setTrackGrouped(project, 0, 3, true);
+    const re = reparse(m);
+    expect(re.arrangements[0]?.tracks[3]?.grouped).toBe(true);
+    // All other tracks unchanged.
+    expect(re.arrangements[0]?.tracks[2]?.grouped === true).toBe(false);
+    expect(re.arrangements[0]?.tracks[4]?.grouped === true).toBe(false);
+  });
+
+  test("setTrackGrouped only touches byte 47 of the target track's blob", async () => {
+    const project = await loadProject();
+    const TRACK_IDX = 5;
+    const before = project.arrangements[0]!.tracks[TRACK_IDX]!;
+    // mutate + reparse — the project's cached arrangements aren't
+    // re-derived after a mutation, so we round-trip through the
+    // serializer to see the post-mutation track.
+    const after = reparse(setTrackGrouped(project, 0, TRACK_IDX, true))
+      .arrangements[0]!.tracks[TRACK_IDX]!;
+    expect(after.iid).toBe(before.iid);
+    expect(after.color).toEqual(before.color);
+    expect(after.icon).toBe(before.icon);
+    expect(after.enabled).toBe(before.enabled);
+    expect(after.height).toBe(before.height);
+    expect(after.locked).toBe(before.locked);
+    expect(after.grouped).toBe(true);
+  });
+
+  test("idempotent: set true twice → still true; set false → ungrouped", async () => {
+    let p = await loadProject();
+    p = setTrackGrouped(p, 0, 1, true);
+    p = setTrackGrouped(p, 0, 1, true);
+    expect(reparse(p).arrangements[0]?.tracks[1]?.grouped).toBe(true);
+    p = setTrackGrouped(p, 0, 1, false);
+    expect(reparse(p).arrangements[0]?.tracks[1]?.grouped === true).toBe(false);
+  });
+
+  test("parent inference: child rows resolve to nearest ungrouped parent above", async () => {
+    // Build PARENT(0) / child-1(1, grouped) / child-2(2, grouped) /
+    // PARENT(3) / child(4, grouped). Verify the bridge's parent_index
+    // logic walking up from a grouped track lands on the right ungrouped
+    // ancestor.
+    let p = await loadProject();
+    p = setTrackName(p, 0, 0, "PARENT-A");
+    p = setTrackName(p, 0, 1, "child-1");
+    p = setTrackGrouped(p, 0, 1, true);
+    p = setTrackName(p, 0, 2, "child-2");
+    p = setTrackGrouped(p, 0, 2, true);
+    p = setTrackName(p, 0, 3, "PARENT-B");
+    p = setTrackName(p, 0, 4, "child-of-B");
+    p = setTrackGrouped(p, 0, 4, true);
+    const re = reparse(p);
+    const t = re.arrangements[0]!.tracks;
+
+    // Replicate the bridge's parent-walk.
+    function parentIndex(idx: number): number {
+      for (let i = idx; i >= 0; i--) {
+        if (i === 0 || t[i]?.grouped !== true) return i;
+      }
+      return 0;
+    }
+
+    expect(parentIndex(0)).toBe(0); // own parent
+    expect(parentIndex(1)).toBe(0); // child of PARENT-A
+    expect(parentIndex(2)).toBe(0); // also child of PARENT-A (consecutive grouped)
+    expect(parentIndex(3)).toBe(3); // own parent (ungrouped)
+    expect(parentIndex(4)).toBe(3); // child of PARENT-B
   });
 });
