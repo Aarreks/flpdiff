@@ -35,7 +35,14 @@ import { FLPParseError } from "./parser/errors.ts";
 import { serializeFLPProject } from "./parser/flp-write.ts";
 import { buildProjectSummary } from "./summary.ts";
 import { toFlpInfoJson } from "./presentation/flp-info.ts";
-import { setTempo, setPatternName, MutationError } from "./mutations/index.ts";
+import {
+  setTempo,
+  setPatternName,
+  setChannelName,
+  setInsertName,
+  setTimeSignature,
+  MutationError,
+} from "./mutations/index.ts";
 
 type BridgeRequest = {
   kind: string;
@@ -69,6 +76,9 @@ const READ_KINDS = new Set([
 const WRITE_KINDS = new Set([
   "set_tempo",
   "set_pattern_name",
+  "set_channel_name",
+  "set_insert_name",
+  "set_time_signature",
 ]);
 
 function readStdinSync(): string {
@@ -133,6 +143,36 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "args.name is required (string)");
       }
       mutated = setPatternName(project, iid, name);
+    } else if (kind === "set_channel_name") {
+      const iid = Number(args["iid"]);
+      const name = args["name"];
+      if (!Number.isFinite(iid)) {
+        throw new MutationError("INVALID_ARGS", "args.iid is required (non-negative integer)");
+      }
+      if (typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name is required (string)");
+      }
+      mutated = setChannelName(project, iid, name);
+    } else if (kind === "set_insert_name") {
+      const index = Number(args["index"]);
+      const name = args["name"];
+      if (!Number.isFinite(index)) {
+        throw new MutationError("INVALID_ARGS", "args.index is required (non-negative integer)");
+      }
+      if (typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name is required (string)");
+      }
+      mutated = setInsertName(project, index, name);
+    } else if (kind === "set_time_signature") {
+      const num = Number(args["numerator"]);
+      const denom = Number(args["denominator"]);
+      if (!Number.isFinite(num)) {
+        throw new MutationError("INVALID_ARGS", "args.numerator is required (positive integer)");
+      }
+      if (!Number.isFinite(denom)) {
+        throw new MutationError("INVALID_ARGS", "args.denominator is required (power-of-2 integer)");
+      }
+      mutated = setTimeSignature(project, num, denom);
     } else {
       return {
         ok: false,

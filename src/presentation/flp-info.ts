@@ -521,10 +521,12 @@ function toArrangement(a: Arrangement): ArrangementJson {
 // --- Metadata --------------------------------------------------------- //
 
 function toMetadata(project: FLPProject, tempo: number): MetadataJson {
-  // TODO: decode format/time_signature/main_pitch/main_volume/pan_law.
+  // TODO: decode format/main_pitch/main_volume/pan_law.
   // Those emit Python defaults for now so the shape matches and the
   // runner flags drift per-field.
   const m = project.metadata;
+  const tsNum = m.timeSignatureNumerator;
+  const tsDenom = m.timeSignatureDenominator;
   return {
     _type: "ProjectMetadata",
     title: m.title ?? "",
@@ -534,7 +536,10 @@ function toMetadata(project: FLPProject, tempo: number): MetadataJson {
     format: "project",
     ppq: project.header.ppq,
     tempo,
-    time_signature: null,
+    time_signature:
+      tsNum !== undefined && tsDenom !== undefined
+        ? { _type: "TimeSignature", numerator: tsNum, denominator: tsDenom }
+        : null,
     main_pitch: m.mainPitch ?? 0,
     main_volume: null,
     pan_law: 0,

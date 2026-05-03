@@ -3,7 +3,15 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseFLPFile, getTempo } from "../src/parser/flp-project.ts";
 import { serializeFLPProject } from "../src/parser/flp-write.ts";
-import { setTempo, setPatternName, MutationError } from "../src/mutations/index.ts";
+import {
+  setTempo,
+  setPatternName,
+  setChannelName,
+  setInsertName,
+  setTimeSignature,
+  MutationError,
+} from "../src/mutations/index.ts";
+import { buildProjectSummary } from "../src/summary.ts";
 
 const FIXTURE = join(import.meta.dir, "corpus/re_base/fl25/base_one_pattern.flp");
 
@@ -107,6 +115,107 @@ describe("setPatternName", () => {
       expect(e).toBeInstanceOf(MutationError);
       if (e instanceof MutationError) expect(e.code).toBe("EVENT_NOT_FOUND");
     }
+  });
+});
+
+describe("setChannelName", () => {
+  test("renames an existing channel by iid", () => {
+    const project = loadProject(FIXTURE);
+    const summaryBefore = buildProjectSummary(project);
+    expect(summaryBefore.channels.length).toBeGreaterThan(0);
+    const targetIid = summaryBefore.channels[0]!.iid;
+
+    const mutated = setChannelName(project, targetIid, "Lead-Synth");
+    const reparsed = reparse(mutated);
+    const summary = buildProjectSummary(reparsed);
+    const ch = summary.channels.find((c) => c.iid === targetIid);
+    expect(ch?.name).toBe("Lead-Synth");
+  });
+
+  test("rejects iid < 0", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setChannelName(project, -1, "x")).toThrow(MutationError);
+  });
+
+  test("rejects empty name", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setChannelName(project, 0, "")).toThrow(MutationError);
+  });
+
+  test("EVENT_NOT_FOUND when channel iid doesn't exist", () => {
+    const project = loadProject(FIXTURE);
+    try {
+      setChannelName(project, 9999, "ghost");
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MutationError);
+      if (e instanceof MutationError) expect(e.code).toBe("EVENT_NOT_FOUND");
+    }
+  });
+});
+
+describe("setInsertName", () => {
+  test("renames mixer insert 1 (first non-master insert)", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setInsertName(project, 1, "Bass-Bus");
+    const reparsed = reparse(mutated);
+    const summary = buildProjectSummary(reparsed);
+    expect(summary.inserts[1]?.name).toBe("Bass-Bus");
+  });
+
+  test("renames master (insert 0)", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setInsertName(project, 0, "MASTER-OUT");
+    const reparsed = reparse(mutated);
+    const summary = buildProjectSummary(reparsed);
+    expect(summary.inserts[0]?.name).toBe("MASTER-OUT");
+  });
+
+  test("rejects index < 0", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setInsertName(project, -1, "x")).toThrow(MutationError);
+  });
+
+  test("EVENT_NOT_FOUND when insert index out of range", () => {
+    const project = loadProject(FIXTURE);
+    try {
+      setInsertName(project, 999, "ghost");
+      throw new Error("expected throw");
+    } catch (e) {
+      expect(e).toBeInstanceOf(MutationError);
+      if (e instanceof MutationError) expect(e.code).toBe("EVENT_NOT_FOUND");
+    }
+  });
+});
+
+describe("setTimeSignature", () => {
+  test("changes the project time signature", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setTimeSignature(project, 6, 8);
+    const reparsed = reparse(mutated);
+    expect(reparsed.metadata?.timeSignatureNumerator).toBe(6);
+    expect(reparsed.metadata?.timeSignatureDenominator).toBe(8);
+  });
+
+  test("rejects non-power-of-2 denominator", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setTimeSignature(project, 4, 3)).toThrow(MutationError);
+    expect(() => setTimeSignature(project, 4, 5)).toThrow(MutationError);
+  });
+
+  test("accepts all power-of-2 denominators in [1, 64]", () => {
+    const project = loadProject(FIXTURE);
+    for (const d of [1, 2, 4, 8, 16, 32, 64]) {
+      const mutated = setTimeSignature(project, 4, d);
+      const reparsed = reparse(mutated);
+      expect(reparsed.metadata?.timeSignatureDenominator).toBe(d);
+    }
+  });
+
+  test("rejects numerator < 1 or > 255", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setTimeSignature(project, 0, 4)).toThrow(MutationError);
+    expect(() => setTimeSignature(project, 256, 4)).toThrow(MutationError);
   });
 });
 
