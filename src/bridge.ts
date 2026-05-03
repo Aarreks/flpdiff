@@ -28,12 +28,14 @@
  * Write kinds land in Phase 3.0.6, gated on the FLP serializer
  * (Phase 3.0.3). Until then, write kinds return UNSUPPORTED_KIND.
  */
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseFLPFile, getTempo } from "./parser/flp-project.ts";
 import { FLPParseError } from "./parser/errors.ts";
+import { serializeFLPProject } from "./parser/flp-write.ts";
 import { buildProjectSummary } from "./summary.ts";
 import { toFlpInfoJson } from "./presentation/flp-info.ts";
+import { setTempo, setPatternName, MutationError } from "./mutations/index.ts";
 
 type BridgeRequest = {
   kind: string;
@@ -62,6 +64,11 @@ const READ_KINDS = new Set([
   "list_mixer",
   "list_patterns",
   "list_plugins",
+]);
+
+const WRITE_KINDS = new Set([
+  "set_tempo",
+  "set_pattern_name",
 ]);
 
 function readStdinSync(): string {
@@ -102,6 +109,63 @@ class BridgeError extends Error {
   }
 }
 
+function executeWrite(
+  kind: string,
+  args: Record<string, unknown>,
+  path: string,
+  project: Awaited<ReturnType<typeof loadProject>>,
+): BridgeResponse {
+  try {
+    let mutated = project;
+    if (kind === "set_tempo") {
+      const bpm = Number(args["bpm"]);
+      if (!Number.isFinite(bpm)) {
+        throw new MutationError("INVALID_ARGS", "args.bpm is required (number)");
+      }
+      mutated = setTempo(project, bpm);
+    } else if (kind === "set_pattern_name") {
+      const iid = Number(args["iid"]);
+      const name = args["name"];
+      if (!Number.isFinite(iid)) {
+        throw new MutationError("INVALID_ARGS", "args.iid is required (positive integer)");
+      }
+      if (typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name is required (string)");
+      }
+      mutated = setPatternName(project, iid, name);
+    } else {
+      return {
+        ok: false,
+        kind,
+        error: "UNKNOWN",
+        message: `write dispatcher fell through for kind=${kind}`,
+      };
+    }
+
+    const bytes = serializeFLPProject(mutated);
+    writeFileSync(resolve(path), bytes);
+    return {
+      ok: true,
+      kind,
+      result: { path: resolve(path), bytes_written: bytes.byteLength },
+    };
+  } catch (err) {
+    if (err instanceof MutationError) {
+      return { ok: false, kind, error: err.code, message: err.message };
+    }
+    if (err instanceof BridgeError) {
+      return { ok: false, kind, error: err.code, message: err.message };
+    }
+    return {
+      ok: false,
+      kind,
+      error: "UNKNOWN",
+      message: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+
 function requirePath(args: Record<string, unknown> | undefined): string {
   const path = args?.["path"];
   if (typeof path !== "string" || !path) {
@@ -113,19 +177,23 @@ function requirePath(args: Record<string, unknown> | undefined): string {
 function execute(req: BridgeRequest): BridgeResponse {
   const { kind, args } = req;
 
-  if (!READ_KINDS.has(kind)) {
-    // write kinds land in 3.0.6
+  if (!READ_KINDS.has(kind) && !WRITE_KINDS.has(kind)) {
+    const all = [...READ_KINDS, ...WRITE_KINDS].sort();
     return {
       ok: false,
       kind,
       error: "UNSUPPORTED_KIND",
-      message: `unknown kind ${JSON.stringify(kind)}; supported: ${Array.from(READ_KINDS).sort().join(", ")}`,
+      message: `unknown kind ${JSON.stringify(kind)}; supported: ${all.join(", ")}`,
     };
   }
 
   try {
     const path = requirePath(args);
     const project = loadProject(path);
+
+    if (WRITE_KINDS.has(kind)) {
+      return executeWrite(kind, args!, path, project);
+    }
 
     switch (kind) {
       case "describe":
@@ -247,6 +315,24 @@ export async function bridgeMain(): Promise<number> {
   }
 
   const response = execute(req);
-  process.stdout.write(JSON.stringify(response) + "\n");
+  await writeStdoutAndFlush(JSON.stringify(response) + "\n");
   return 0;
+}
+
+
+async function writeStdoutAndFlush(data: string): Promise<void> {
+  // Bun/Node's process.stdout is buffered. For large payloads (e.g.
+  // describe ~100KB) the process can exit before the write drains,
+  // truncating the JSON delivered to the parent. Explicitly wait
+  // for the write callback before returning.
+  await new Promise<void>((resolveCb, rejectCb) => {
+    const flushed = process.stdout.write(data, (err) => {
+      if (err) rejectCb(err);
+      else resolveCb();
+    });
+    if (flushed) {
+      // Buffer accepted synchronously — the callback may still fire
+      // later; wait for it just in case.
+    }
+  });
 }
