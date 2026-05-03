@@ -6,14 +6,17 @@ import { serializeFLPProject } from "../src/parser/flp-write.ts";
 
 const CORPUS_ROOT = join(import.meta.dir, "corpus");
 
+const INCLUDE_LOCAL = process.env.INCLUDE_LOCAL === "1";
+
 function listFLPs(dir: string): string[] {
   const out: string[] = [];
   for (const name of readdirSync(dir)) {
     const full = join(dir, name);
     const s = statSync(full);
     if (s.isDirectory()) {
-      // Skip user-local corpus (gitignored, may not exist on CI)
-      if (name === "local") continue;
+      // Skip user-local corpus by default (gitignored, may not exist on CI).
+      // Opt in with INCLUDE_LOCAL=1 to round-trip personal FLPs too.
+      if (name === "local" && !INCLUDE_LOCAL) continue;
       out.push(...listFLPs(full));
     } else if (name.endsWith(".flp")) {
       out.push(full);
