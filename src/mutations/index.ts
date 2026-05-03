@@ -34,6 +34,22 @@ const OP_INSERT_FLAGS = 0xec; // FL-25 insert flags blob; closes channel scope (
 const OP_INSERT_NAME = 0xcc; // per-insert name (UTF-16LE)
 const OP_PROJECT_TIME_SIG_NUM = 0x11; // u8 project numerator
 const OP_PROJECT_TIME_SIG_DENOM = 0x12; // u8 project denominator
+const OP_CHANNEL_COLOR = 0x80; // u32 RGBA in channel scope (shared with plugin color)
+const OP_INSERT_COLOR = 0x95; // u32 RGBA in mixer-insert scope
+const OP_PATTERN_COLOR = 0x96; // u32 RGBA in pattern scope
+const OP_CHANNEL_ROUTED_TO = 0x16; // u8 (signed int8) in channel scope; -1 = unrouted
+
+export type RGBA = { r: number; g: number; b: number; a?: number };
+
+function packRGBA({ r, g, b, a = 0 }: RGBA): number {
+  for (const [n, v] of Object.entries({ r, g, b, a })) {
+    if (!Number.isInteger(v) || v < 0 || v > 255) {
+      throw new MutationError("INVALID_ARGS", `RGBA.${n} must be integer in [0, 255], got ${v}`);
+    }
+  }
+  // Mirror unpackRGBA's byte order: low byte = R.
+  return ((a & 0xff) << 24) | ((b & 0xff) << 16) | ((g & 0xff) << 8) | (r & 0xff);
+}
 
 // --------------------------------------------------------------------------- //
 // setTempo
@@ -373,6 +389,263 @@ export function setTimeSignature(
 
   events[numIdx] = { kind: "u8", opcode: OP_PROJECT_TIME_SIG_NUM, value: numerator };
   events[denomIdx] = { kind: "u8", opcode: OP_PROJECT_TIME_SIG_DENOM, value: denominator };
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
+// setChannelColor / setInsertColor / setPatternColor
+// --------------------------------------------------------------------------- //
+
+/**
+ * Generic helper for u32-RGBA color events scoped inside a block.
+ * Walks events to the block opener whose `value === id`, scans the
+ * block range (bounded by the next opener-of-same-kind OR by any
+ * supplied `closerOpcodes`), replaces the first matching color event
+ * if found, else inserts immediately after the opener.
+ */
+function setBlockColorU32(
+  project: FLPProject,
+  opts: {
+    blockOpenOpcode: number;
+    blockOpenKind: "u16";
+    blockId: number;
+    colorOpcode: number;
+    closerOpcodes?: ReadonlyArray<{ opcode: number; kind: FLPEvent["kind"] }>;
+    rgba: RGBA;
+    blockLabel: string;
+  },
+): FLPProject {
+  const events = [...project.events];
+  const newValue = packRGBA(opts.rgba);
+
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind === opts.blockOpenKind &&
+      ev.opcode === opts.blockOpenOpcode &&
+      ev.value === opts.blockId
+    ) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no ${opts.blockLabel} with id=${opts.blockId} found`,
+    );
+  }
+
+  let endIndex = events.length;
+  const closers = opts.closerOpcodes ?? [];
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === opts.blockOpenKind && ev.opcode === opts.blockOpenOpcode) {
+      endIndex = i;
+      break;
+    }
+    for (const c of closers) {
+      if (ev.kind === c.kind && ev.opcode === c.opcode) {
+        endIndex = i;
+        break;
+      }
+    }
+    if (endIndex !== events.length) break;
+  }
+
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u32" && ev.opcode === opts.colorOpcode) {
+      events[i] = { kind: "u32", opcode: opts.colorOpcode, value: newValue };
+      return { ...project, events };
+    }
+  }
+
+  events.splice(openIndex + 1, 0, { kind: "u32", opcode: opts.colorOpcode, value: newValue });
+  return { ...project, events };
+}
+
+export function setChannelColor(project: FLPProject, iid: number, rgba: RGBA): FLPProject {
+  if (!Number.isInteger(iid) || iid < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `channel iid must be a non-negative integer, got ${iid}`,
+    );
+  }
+  return setBlockColorU32(project, {
+    blockOpenOpcode: OP_NEW_CHANNEL,
+    blockOpenKind: "u16",
+    blockId: iid,
+    colorOpcode: OP_CHANNEL_COLOR,
+    closerOpcodes: [
+      { opcode: OP_INSERT_END, kind: "u32" },
+      { opcode: OP_INSERT_FLAGS, kind: "blob" },
+    ],
+    rgba,
+    blockLabel: "channel",
+  });
+}
+
+/**
+ * Insert color (`0x95`). Insert blocks are bounded by `0x93` closers,
+ * not by an opener event — so we use a different strategy than the
+ * channel/pattern walkers.
+ */
+export function setInsertColor(project: FLPProject, index: number, rgba: RGBA): FLPProject {
+  if (!Number.isInteger(index) || index < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `insert index must be a non-negative integer, got ${index}`,
+    );
+  }
+  const events = [...project.events];
+  const newValue = packRGBA(rgba);
+
+  let kthCloseIdx = -1;
+  let prevCloseIdx = -1;
+  let seen = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u32" && ev.opcode === OP_INSERT_END) {
+      seen += 1;
+      if (seen === index) {
+        kthCloseIdx = i;
+        break;
+      }
+      prevCloseIdx = i;
+    }
+  }
+  if (kthCloseIdx === -1) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no mixer insert with index=${index} found (saw ${seen + 1} 0x93 closers)`,
+    );
+  }
+
+  for (let i = prevCloseIdx + 1; i < kthCloseIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u32" && ev.opcode === OP_INSERT_COLOR) {
+      events[i] = { kind: "u32", opcode: OP_INSERT_COLOR, value: newValue };
+      return { ...project, events };
+    }
+  }
+  events.splice(kthCloseIdx, 0, { kind: "u32", opcode: OP_INSERT_COLOR, value: newValue });
+  return { ...project, events };
+}
+
+export function setPatternColor(project: FLPProject, iid: number, rgba: RGBA): FLPProject {
+  if (!Number.isInteger(iid) || iid < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern iid must be a positive integer (1-based), got ${iid}`,
+    );
+  }
+  // Pattern blocks open at 0x41 with the pattern id; FL emits 0x41
+  // twice per pattern — we just need ANY 0x41 with this id, then walk
+  // until the NEXT 0x41 (regardless of id) or end-of-events.
+  const events = [...project.events];
+  const newValue = packRGBA(rgba);
+
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW && ev.value === iid) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with iid=${iid} found`);
+  }
+
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW) {
+      endIndex = i;
+      break;
+    }
+  }
+
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u32" && ev.opcode === OP_PATTERN_COLOR) {
+      events[i] = { kind: "u32", opcode: OP_PATTERN_COLOR, value: newValue };
+      return { ...project, events };
+    }
+  }
+  events.splice(openIndex + 1, 0, { kind: "u32", opcode: OP_PATTERN_COLOR, value: newValue });
+  return { ...project, events };
+}
+
+// --------------------------------------------------------------------------- //
+// setChannelRouting
+// --------------------------------------------------------------------------- //
+
+/**
+ * Replace channel `iid`'s mixer-insert routing target. The opcode is
+ * `0x16`, a BYTE-range u8 interpreted as signed int8. `-1` (encoded
+ * 0xFF) means unrouted (default to master).
+ */
+export function setChannelRouting(
+  project: FLPProject,
+  iid: number,
+  targetInsert: number,
+): FLPProject {
+  if (!Number.isInteger(iid) || iid < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `channel iid must be a non-negative integer, got ${iid}`,
+    );
+  }
+  if (!Number.isInteger(targetInsert) || targetInsert < -1 || targetInsert > 127) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `targetInsert must be integer in [-1, 127] (signed int8), got ${targetInsert}`,
+    );
+  }
+
+  const events = [...project.events];
+  const encoded = targetInsert < 0 ? targetInsert + 256 : targetInsert; // -1 → 0xFF
+
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL && ev.value === iid) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError("EVENT_NOT_FOUND", `no channel with iid=${iid} found`);
+  }
+
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) ||
+      (ev.kind === "u32" && ev.opcode === OP_INSERT_END) ||
+      (ev.kind === "blob" && ev.opcode === OP_INSERT_FLAGS)
+    ) {
+      endIndex = i;
+      break;
+    }
+  }
+
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u8" && ev.opcode === OP_CHANNEL_ROUTED_TO) {
+      events[i] = { kind: "u8", opcode: OP_CHANNEL_ROUTED_TO, value: encoded };
+      return { ...project, events };
+    }
+  }
+  events.splice(openIndex + 1, 0, {
+    kind: "u8",
+    opcode: OP_CHANNEL_ROUTED_TO,
+    value: encoded,
+  });
   return { ...project, events };
 }
 

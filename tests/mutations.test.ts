@@ -9,9 +9,14 @@ import {
   setChannelName,
   setInsertName,
   setTimeSignature,
+  setChannelColor,
+  setInsertColor,
+  setPatternColor,
+  setChannelRouting,
   MutationError,
 } from "../src/mutations/index.ts";
 import { buildProjectSummary } from "../src/summary.ts";
+import { buildChannels } from "../src/parser/project-builder.ts";
 
 const FIXTURE = join(import.meta.dir, "corpus/re_base/fl25/base_one_pattern.flp");
 
@@ -216,6 +221,110 @@ describe("setTimeSignature", () => {
     const project = loadProject(FIXTURE);
     expect(() => setTimeSignature(project, 0, 4)).toThrow(MutationError);
     expect(() => setTimeSignature(project, 256, 4)).toThrow(MutationError);
+  });
+});
+
+describe("setChannelColor", () => {
+  test("sets a channel color (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    const iid = buildProjectSummary(project).channels[0]!.iid;
+    const mutated = setChannelColor(project, iid, { r: 255, g: 100, b: 50 });
+    const reparsed = reparse(mutated);
+    const ch = buildProjectSummary(reparsed).channels.find((c) => c.iid === iid);
+    expect(ch?.color).toEqual({ r: 255, g: 100, b: 50, a: 0 });
+  });
+
+  test("rejects invalid RGB", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setChannelColor(project, 0, { r: -1, g: 0, b: 0 })).toThrow(MutationError);
+    expect(() => setChannelColor(project, 0, { r: 256, g: 0, b: 0 })).toThrow(MutationError);
+  });
+
+  test("EVENT_NOT_FOUND for missing channel iid", () => {
+    const project = loadProject(FIXTURE);
+    try {
+      setChannelColor(project, 9999, { r: 0, g: 0, b: 0 });
+      throw new Error("expected throw");
+    } catch (e) {
+      if (e instanceof MutationError) expect(e.code).toBe("EVENT_NOT_FOUND");
+      else throw e;
+    }
+  });
+});
+
+describe("setInsertColor", () => {
+  test("sets insert color round-trip", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setInsertColor(project, 1, { r: 12, g: 34, b: 56 });
+    const reparsed = reparse(mutated);
+    expect(buildProjectSummary(reparsed).inserts[1]?.color).toEqual({
+      r: 12,
+      g: 34,
+      b: 56,
+      a: 0,
+    });
+  });
+
+  test("master (insert 0) color", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setInsertColor(project, 0, { r: 200, g: 200, b: 200 });
+    const reparsed = reparse(mutated);
+    expect(buildProjectSummary(reparsed).inserts[0]?.color).toEqual({
+      r: 200,
+      g: 200,
+      b: 200,
+      a: 0,
+    });
+  });
+
+  test("EVENT_NOT_FOUND for out-of-range insert", () => {
+    const project = loadProject(FIXTURE);
+    try {
+      setInsertColor(project, 9999, { r: 0, g: 0, b: 0 });
+      throw new Error("expected throw");
+    } catch (e) {
+      if (e instanceof MutationError) expect(e.code).toBe("EVENT_NOT_FOUND");
+      else throw e;
+    }
+  });
+});
+
+describe("setPatternColor", () => {
+  test("sets pattern color round-trip", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setPatternColor(project, 1, { r: 222, g: 11, b: 99 });
+    const reparsed = reparse(mutated);
+    const p = reparsed.patterns.find((x) => x.id === 1);
+    expect(p?.color).toEqual({ r: 222, g: 11, b: 99, a: 0 });
+  });
+
+  test("rejects iid < 1", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setPatternColor(project, 0, { r: 0, g: 0, b: 0 })).toThrow(MutationError);
+  });
+});
+
+describe("setChannelRouting", () => {
+  test("routes channel iid=0 to insert 3", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setChannelRouting(project, 0, 3);
+    const reparsed = reparse(mutated);
+    const ch = buildChannels(reparsed.events, reparsed.metadata).find((c) => c.iid === 0);
+    expect(ch?.targetInsert).toBe(3);
+  });
+
+  test("unroutes via -1", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setChannelRouting(project, 0, -1);
+    const reparsed = reparse(mutated);
+    const ch = buildChannels(reparsed.events, reparsed.metadata).find((c) => c.iid === 0);
+    expect(ch?.targetInsert).toBe(-1);
+  });
+
+  test("rejects out-of-range insert target", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setChannelRouting(project, 0, 128)).toThrow(MutationError);
+    expect(() => setChannelRouting(project, 0, -2)).toThrow(MutationError);
   });
 });
 

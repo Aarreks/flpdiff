@@ -41,7 +41,12 @@ import {
   setChannelName,
   setInsertName,
   setTimeSignature,
+  setChannelColor,
+  setInsertColor,
+  setPatternColor,
+  setChannelRouting,
   MutationError,
+  type RGBA,
 } from "./mutations/index.ts";
 
 type BridgeRequest = {
@@ -79,7 +84,28 @@ const WRITE_KINDS = new Set([
   "set_channel_name",
   "set_insert_name",
   "set_time_signature",
+  "set_channel_color",
+  "set_insert_color",
+  "set_pattern_color",
+  "set_channel_routing",
 ]);
+
+function parseRGBAArg(args: Record<string, unknown>): RGBA {
+  const c = args["color"];
+  if (!c || typeof c !== "object") {
+    throw new MutationError("INVALID_ARGS", "args.color is required (object {r,g,b,a?})");
+  }
+  const obj = c as Record<string, unknown>;
+  const r = Number(obj["r"]);
+  const g = Number(obj["g"]);
+  const b = Number(obj["b"]);
+  const aRaw = obj["a"];
+  const a = aRaw === undefined ? 0 : Number(aRaw);
+  if (![r, g, b, a].every(Number.isFinite)) {
+    throw new MutationError("INVALID_ARGS", "args.color components must be numeric");
+  }
+  return { r, g, b, a };
+}
 
 function readStdinSync(): string {
   // Bun/Node accept fd 0 for stdin. Slurps until EOF, returns full buffer.
@@ -173,6 +199,34 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "args.denominator is required (power-of-2 integer)");
       }
       mutated = setTimeSignature(project, num, denom);
+    } else if (kind === "set_channel_color") {
+      const iid = Number(args["iid"]);
+      if (!Number.isFinite(iid)) {
+        throw new MutationError("INVALID_ARGS", "args.iid is required (non-negative integer)");
+      }
+      mutated = setChannelColor(project, iid, parseRGBAArg(args));
+    } else if (kind === "set_insert_color") {
+      const index = Number(args["index"]);
+      if (!Number.isFinite(index)) {
+        throw new MutationError("INVALID_ARGS", "args.index is required (non-negative integer)");
+      }
+      mutated = setInsertColor(project, index, parseRGBAArg(args));
+    } else if (kind === "set_pattern_color") {
+      const iid = Number(args["iid"]);
+      if (!Number.isFinite(iid)) {
+        throw new MutationError("INVALID_ARGS", "args.iid is required (positive integer)");
+      }
+      mutated = setPatternColor(project, iid, parseRGBAArg(args));
+    } else if (kind === "set_channel_routing") {
+      const iid = Number(args["iid"]);
+      const target = Number(args["target_insert"]);
+      if (!Number.isFinite(iid)) {
+        throw new MutationError("INVALID_ARGS", "args.iid is required (non-negative integer)");
+      }
+      if (!Number.isFinite(target)) {
+        throw new MutationError("INVALID_ARGS", "args.target_insert is required (-1 or 0..127)");
+      }
+      mutated = setChannelRouting(project, iid, target);
     } else {
       return {
         ok: false,
