@@ -28,6 +28,7 @@ import {
   type Scope,
   type DriverMode,
 } from "./git.ts";
+import { bridgeMain } from "./bridge.ts";
 import { basename } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
 
@@ -55,7 +56,13 @@ Exit codes (diff):
   2  parse or I/O error
 `;
 
-const SUBCOMMANDS = new Set(["info", "git-setup", "git-driver", "git-verify"]);
+const SUBCOMMANDS = new Set([
+  "info",
+  "git-setup",
+  "git-driver",
+  "git-verify",
+  "bridge",
+]);
 
 export async function run(argv: readonly string[]): Promise<number> {
   if (argv.length === 0) {
@@ -85,6 +92,8 @@ export async function run(argv: readonly string[]): Promise<number> {
         return runGitVerify(rest);
       case "git-driver":
         return gitDriverMain(rest);
+      case "bridge":
+        return bridgeMain();
     }
   }
 
