@@ -1,37 +1,53 @@
 /**
  * Code-level Ableton-style reorganize for FL Studio projects.
  *
- * Pure deterministic logic — no LLM. Classifies channels via regex
- * matching on name + sample_path, falling back to MIDI-pitch buckets
- * for unnamed plugin channels (e.g. Serum). Then assigns each enabled
- * channel a dedicated mixer insert (1, 2, 3, ...), applies semantic
- * names + palette colors per group, and recolors patterns by the
- * dominant channel they reference.
+ * v1: **playlist-tracks-only**. We classify each clip in the
+ * arrangement, lay out the playlist tracks in family blocks
+ * (`[Drums]` / `[Bass]` / `[Lead]` / ...), then move clips to their
+ * target track + set track name + color. We **never touch channels,
+ * mixer inserts, or patterns** — those carry intentional engineering
+ * (channel→insert routing, parallel chains, sample-name-as-source-info,
+ * pattern reuse semantics) that an automated tool would destroy.
  *
- * Decision: this module owns the rule layer (orchestration + classifier).
- * The atomic mutations (`setChannelName`, `setChannelRouting`, etc.)
- * remain in `mutations/index.ts` — we just compose them.
+ * The previous v0 (channel renames / insert renames / routing changes /
+ * pattern recolors) was a design flaw — see commit message of the
+ * rewrite for the discussion.
  *
- * Invariants the algorithm guarantees on a successful run (verified by
- * the harness in `mcp/tests/e2e/harness/invariants.py`):
- *   1. Every named channel/insert/pattern has a semantic name.
- *   2. Every enabled channel routes to its own non-Master insert (1..N).
- *   3. Colors come from `PALETTE`.
- *   4. Clip count + per-pattern note count unchanged.
- *   5. Bit-exact round-trip via the canonical serializer.
+ * Algorithm:
+ *
+ *   1. For each clip in the arrangement:
+ *        - kind="channel" → classify the referenced channel
+ *        - kind="pattern" → classify the pattern by its dominant channel
+ *      Result: each clip belongs to a *lane* (one lane per unique
+ *      channel/pattern reference) with a content `Group`.
+ *
+ *   2. Sort lanes by family in fixed order
+ *      (drums_hard → drums_soft → bass → lead → pad → fx → vocal →
+ *      other), then by min(referenced_iid) within family.
+ *
+ *   3. Allocate a sequential block of playlist tracks per family,
+ *      with an empty `[Family]` separator track between blocks
+ *      (toggleable via `addFamilySeparators`).
+ *
+ *   4. Emit mutations: move every clip to its lane's target track
+ *      (via `moveClip`), set name + color on each used track. NEVER
+ *      touch channels / inserts / patterns.
+ *
+ * Invariants this guarantees:
+ *   * Every channel/insert/pattern is byte-identical before/after.
+ *   * Every clip is preserved (count + per-pattern note count).
+ *   * Tracks 0..N have palette colors + semantic names; tracks above
+ *     stay default.
+ *   * Bit-exact round-trip via the canonical serializer.
  */
 
 import type { FLPProject } from "../parser/flp-project.ts";
-import type { Note, Pattern } from "../model/pattern.ts";
-import type { Channel, RGBA } from "../model/channel.ts";
+import type { Note } from "../model/pattern.ts";
 import {
-  setChannelColor,
-  setChannelName,
-  setChannelRouting,
-  setInsertColor,
-  setInsertName,
-  setPatternColor,
-  setPatternName,
+  moveClip,
+  setTrackColor,
+  setTrackGrouped,
+  setTrackName,
 } from "../mutations/index.ts";
 
 // --------------------------------------------------------------------------- //
@@ -45,25 +61,18 @@ export type GroupKey =
   | "lead"
   | "pad"
   | "fx"
-  | "vocal";
+  | "vocal"
+  | "other";
 
 export type Group = {
-  /** Logical bucket. Drives palette choice. */
+  /** Logical bucket. Drives palette choice + family ordering. */
   key: GroupKey;
-  /** Default semantic name for a freshly-classified channel in this group. */
+  /** Default name for a freshly-classified content track in this group. */
   name: string;
   /** Color RGB (alpha defaults to 0 to match how the bridge round-trips user-set FL colors). */
   rgb: { r: number; g: number; b: number };
 };
 
-/**
- * Ordered (keyword, Group) pairs. Earlier entries take precedence on
- * ambiguous matches. Order matters: most-specific first.
- *
- * (We use an array, not a plain object, because JS sorts numeric-like
- * object keys ahead of string keys — `"808"` would jump to the front
- * of `Object.keys` and shadow `kick` for inputs like "808 Kick".)
- */
 const PALETTE_DRUMS_HARD = { r: 233, g: 75, b: 60 };
 const PALETTE_DRUMS_SOFT = { r: 255, g: 140, b: 66 };
 const PALETTE_BASS = { r: 59, g: 130, b: 246 };
@@ -71,9 +80,13 @@ const PALETTE_LEAD = { r: 34, g: 197, b: 94 };
 const PALETTE_PAD = { r: 139, g: 92, b: 246 };
 const PALETTE_FX = { r: 236, g: 72, b: 153 };
 const PALETTE_VOCAL = { r: 250, g: 204, b: 21 };
+const PALETTE_OTHER = { r: 100, g: 116, b: 139 }; // slate gray
 
+/**
+ * Ordered (keyword, Group) pairs. Earlier entries take precedence on
+ * ambiguous matches. Order matters: most-specific first.
+ */
 export const GROUP_ENTRIES: Array<[string, Group]> = [
-  // Drums first — most specific.
   ["kick", { key: "drums_hard", name: "Kick", rgb: PALETTE_DRUMS_HARD }],
   ["snare", { key: "drums_hard", name: "Snare", rgb: PALETTE_DRUMS_HARD }],
   ["clap", { key: "drums_hard", name: "Clap", rgb: PALETTE_DRUMS_HARD }],
@@ -83,24 +96,19 @@ export const GROUP_ENTRIES: Array<[string, Group]> = [
   ["tom", { key: "drums_soft", name: "Tom", rgb: PALETTE_DRUMS_SOFT }],
   ["shaker", { key: "drums_soft", name: "Shaker", rgb: PALETTE_DRUMS_SOFT }],
   ["cymbal", { key: "drums_soft", name: "Cymbal", rgb: PALETTE_DRUMS_SOFT }],
-  // Vocal before lead — "Lead Vox" reads as a vocal track, not a lead synth.
   ["vox", { key: "vocal", name: "Vocal", rgb: PALETTE_VOCAL }],
   ["vocal", { key: "vocal", name: "Vocal", rgb: PALETTE_VOCAL }],
-  // Bass.
   ["bass", { key: "bass", name: "Bass", rgb: PALETTE_BASS }],
   ["sub", { key: "bass", name: "Sub Bass", rgb: PALETTE_BASS }],
   ["808", { key: "bass", name: "808", rgb: PALETTE_BASS }],
-  // Lead/melody/synth.
   ["lead", { key: "lead", name: "Lead", rgb: PALETTE_LEAD }],
   ["melody", { key: "lead", name: "Melody", rgb: PALETTE_LEAD }],
   ["arp", { key: "lead", name: "Arp", rgb: PALETTE_LEAD }],
   ["synth", { key: "lead", name: "Synth", rgb: PALETTE_LEAD }],
   ["piano", { key: "lead", name: "Piano", rgb: PALETTE_LEAD }],
-  // Pad/atmosphere.
   ["pad", { key: "pad", name: "Pad", rgb: PALETTE_PAD }],
   ["string", { key: "pad", name: "Strings", rgb: PALETTE_PAD }],
   ["atmos", { key: "pad", name: "Atmos", rgb: PALETTE_PAD }],
-  // FX last — riser/sweep are often suffixes of named FX channels.
   ["fx", { key: "fx", name: "FX", rgb: PALETTE_FX }],
   ["riser", { key: "fx", name: "Riser", rgb: PALETTE_FX }],
   ["sweep", { key: "fx", name: "Sweep", rgb: PALETTE_FX }],
@@ -115,21 +123,47 @@ const KEYWORD_REGEXES: Array<[string, RegExp]> = GROUP_ENTRIES.map(([kw]) => [
   new RegExp(`\\b${kw.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&")}\\b`, "i"),
 ]);
 
-/**
- * Classify a channel by regex-matching keywords against its name + sample path.
- * Returns the first matching `Group` (insertion order wins) or `null` for
- * unknown content — caller can fall back to `classifyByPitchRange`.
- */
+/** Family display order — matches Ableton's typical session view. */
+export const FAMILY_ORDER: GroupKey[] = [
+  "drums_hard",
+  "drums_soft",
+  "bass",
+  "lead",
+  "pad",
+  "fx",
+  "vocal",
+  "other",
+];
+
+/** Family display name + representative palette color (used for separator tracks). */
+export const FAMILY_LABELS: Record<GroupKey, { label: string; rgb: { r: number; g: number; b: number } }> = {
+  drums_hard: { label: "Drums", rgb: PALETTE_DRUMS_HARD },
+  drums_soft: { label: "Drums (Soft)", rgb: PALETTE_DRUMS_SOFT },
+  bass: { label: "Bass", rgb: PALETTE_BASS },
+  lead: { label: "Lead", rgb: PALETTE_LEAD },
+  pad: { label: "Pad", rgb: PALETTE_PAD },
+  fx: { label: "FX", rgb: PALETTE_FX },
+  vocal: { label: "Vocal", rgb: PALETTE_VOCAL },
+  other: { label: "Other", rgb: PALETTE_OTHER },
+};
+
+const OTHER_GROUP: Group = {
+  key: "other",
+  name: "Other",
+  rgb: PALETTE_OTHER,
+};
+
 /**
  * Insert spaces at lowercase→uppercase transitions so camelCase compound
  * names like "HiHat" expose word boundaries to the keyword regex.
- * "HiHat" → "Hi Hat" (matches \bhat\b); "Hatchet" stays "Hatchet"
- * (no transition; \bhat\b correctly does NOT match).
  */
 function splitCamelCase(text: string): string {
   return text.replace(/([a-z0-9])([A-Z])/g, "$1 $2");
 }
 
+/**
+ * Classify a channel by regex-matching keywords against its name + sample path.
+ */
 export function classifyChannel(
   name: string | undefined,
   samplePath: string | undefined,
@@ -138,16 +172,13 @@ export function classifyChannel(
   if (!raw.trim()) return null;
   const text = splitCamelCase(raw);
   for (let i = 0; i < KEYWORD_REGEXES.length; i++) {
-    const entry = KEYWORD_REGEXES[i]!;
-    if (entry[1].test(text)) return GROUP_ENTRIES[i]![1];
+    if (KEYWORD_REGEXES[i]![1].test(text)) return GROUP_ENTRIES[i]![1];
   }
   return null;
 }
 
 /**
- * Fallback for channels with no name match (e.g. a bare "Serum" plugin
- * channel): bucket by the average MIDI key of notes targeting this
- * channel. Returns null when the channel has no notes anywhere.
+ * Fallback: bucket by the average MIDI key of notes targeting this lane.
  */
 export function classifyByPitchRange(notes: readonly Note[]): Group | null {
   if (notes.length === 0) return null;
@@ -161,152 +192,236 @@ export function classifyByPitchRange(notes: readonly Note[]): Group | null {
 // Plan                                                                         //
 // --------------------------------------------------------------------------- //
 
-export type ChannelMutation = {
-  iid: number;
-  name: string;
-  rgb: { r: number; g: number; b: number };
-  /** Insert index 1..N this channel will route to. */
-  target_insert: number;
+const PATTERN_BASE = 20480;
+
+type LaneKind = "channel" | "pattern";
+
+/** A unique playlist lane — one per (kind, ref_id) referenced by clips. */
+type Lane = {
+  kind: LaneKind;
+  refId: number;
+  group: Group;
+  /** Display name we'll set on the lane's playlist track. */
+  displayName: string;
+  /** Channel iid (or pattern's dominant channel iid) — used for in-family ordering. */
+  sortKey: number;
+  /** Indices into `arrangement.clips` that belong to this lane. */
+  clipIndices: number[];
 };
 
-export type InsertMutation = {
-  index: number;
-  name: string;
-  rgb: { r: number; g: number; b: number };
-};
-
-export type PatternMutation = {
-  iid: number;
-  /** New name — undefined means "keep existing name". */
+export type TrackMutation = {
+  trackIndex: number;
   name?: string;
-  rgb: { r: number; g: number; b: number };
+  rgb?: { r: number; g: number; b: number };
+  grouped?: boolean;
+  /** True for empty `[Family]` separator rows (no clip moves into them). */
+  isFamilySeparator?: boolean;
+  /** True when name was already-semantic and `preserveExistingTrackNames` skipped renaming. */
+  namePreserved?: boolean;
+};
+
+export type ClipMoveMutation = {
+  /** Position of the clip in `arrangement.clips` before mutation. */
+  fromTrackIndex: number;
+  fromPositionTicks: number;
+  refId: number;
+  refKind: LaneKind;
+  toTrackIndex: number;
 };
 
 export type ReorganizePlan = {
-  channels: ChannelMutation[];
-  inserts: InsertMutation[];
-  patterns: PatternMutation[];
+  arrangementId: number;
+  tracks: TrackMutation[];
+  clipMoves: ClipMoveMutation[];
 };
 
 export type ReorganizeOptions = {
-  /**
-   * If true, channels whose existing name is already semantic (passes
-   * `isSemanticName`) keep their original name. Default: true.
-   */
-  preserveExistingNames?: boolean;
-  /**
-   * If true, pattern names that look like defaults ("Pattern", "Pattern 3")
-   * get rewritten to their dominant-channel group name; existing custom
-   * names are kept regardless. Default: true.
-   */
-  renameDefaultPatterns?: boolean;
+  /** Which arrangement to reorganize. Default 0. */
+  arrangementId?: number;
+  /** Insert empty `[Family]` separator tracks between family blocks. Default true. */
+  addFamilySeparators?: boolean;
+  /** Skip renaming tracks that already have a non-default name. Default true. */
+  preserveExistingTrackNames?: boolean;
 };
 
-const DEFAULT_NAME_RE = /^(Sample|Track|Insert|Channel|Pattern|Audio Track)\s*\d*$/i;
+const DEFAULT_TRACK_NAME_RE = /^(Track|Audio Track)\s*\d*$/i;
 
-function isDefaultName(name: string | undefined): boolean {
+function isDefaultTrackName(name: string | undefined): boolean {
   if (!name) return true;
-  return DEFAULT_NAME_RE.test(name.trim());
+  return DEFAULT_TRACK_NAME_RE.test(name.trim());
+}
+
+function notesByChannelIid(project: FLPProject): Map<number, Note[]> {
+  const out = new Map<number, Note[]>();
+  for (const pat of project.patterns) {
+    for (const n of pat.notes) {
+      const list = out.get(n.channel_iid) ?? [];
+      list.push(n);
+      out.set(n.channel_iid, list);
+    }
+  }
+  return out;
+}
+
+function dominantChannelIid(noteList: readonly Note[]): number | undefined {
+  if (noteList.length === 0) return undefined;
+  const counts = new Map<number, number>();
+  for (const n of noteList) counts.set(n.channel_iid, (counts.get(n.channel_iid) ?? 0) + 1);
+  let bestIid = -1;
+  let bestCount = -1;
+  for (const [iid, c] of counts) {
+    if (c > bestCount) {
+      bestCount = c;
+      bestIid = iid;
+    }
+  }
+  return bestIid >= 0 ? bestIid : undefined;
 }
 
 /**
- * Compute the mutation plan from a parsed project. No project state mutated.
- *
- * Algorithm:
- *   1. Walk channels in iid order; classify each enabled one.
- *   2. Assign sequential inserts (1..N), de-dup names ("Kick" / "Kick 2" / ...).
- *   3. Per pattern, count notes-per-group and pick the winner; recolor +
- *      optionally rename if the existing name is a default.
+ * Walk the arrangement's clips, classify each into a `Lane`, return the
+ * keyed map ready for sorting + layout.
+ */
+function collectLanes(project: FLPProject, arrangementId: number): Map<string, Lane> {
+  const arr = project.arrangements.find((a) => a.id === arrangementId);
+  if (!arr) return new Map();
+  const channelsByIid = new Map(project.channels.map((c) => [c.iid, c]));
+  const patternsById = new Map(project.patterns.map((p) => [p.id, p]));
+  const allNotesByCh = notesByChannelIid(project);
+
+  const lanes = new Map<string, Lane>();
+  for (let i = 0; i < arr.clips.length; i++) {
+    const clip = arr.clips[i]!;
+    const isPattern = clip.item_index > PATTERN_BASE;
+    const kind: LaneKind = isPattern ? "pattern" : "channel";
+    const refId = isPattern ? clip.item_index - PATTERN_BASE : clip.item_index;
+    const key = `${kind}:${refId}`;
+    let lane = lanes.get(key);
+    if (!lane) {
+      let group: Group | null = null;
+      let displayName = "";
+      let sortKey = refId;
+
+      if (kind === "channel") {
+        const ch = channelsByIid.get(refId);
+        const chNotes = allNotesByCh.get(refId) ?? [];
+        group = classifyChannel(ch?.name, ch?.sample_path) ?? classifyByPitchRange(chNotes);
+        displayName = ch?.name?.trim() || `Channel ${refId}`;
+        sortKey = refId;
+      } else {
+        const pat = patternsById.get(refId);
+        const dominantIid = dominantChannelIid(pat?.notes ?? []);
+        const dominantCh =
+          dominantIid !== undefined ? channelsByIid.get(dominantIid) : undefined;
+        group =
+          classifyChannel(dominantCh?.name, dominantCh?.sample_path) ??
+          classifyByPitchRange(pat?.notes ?? []);
+        displayName = pat?.name?.trim() || dominantCh?.name?.trim() || `Pattern ${refId}`;
+        sortKey = dominantIid ?? refId + 100_000; // unknown patterns sort last in family
+      }
+      if (!group) group = OTHER_GROUP;
+      lane = { kind, refId, group, displayName, sortKey, clipIndices: [] };
+      lanes.set(key, lane);
+    }
+    lane.clipIndices.push(i);
+  }
+  return lanes;
+}
+
+/**
+ * Compute the mutation plan for a single arrangement. No project state mutated.
  */
 export function planReorganize(
   project: FLPProject,
   options: ReorganizeOptions = {},
 ): ReorganizePlan {
-  const preserveExisting = options.preserveExistingNames ?? true;
-  const renameDefaults = options.renameDefaultPatterns ?? true;
+  const arrangementId = options.arrangementId ?? 0;
+  const addSeparators = options.addFamilySeparators ?? true;
+  const preserveNames = options.preserveExistingTrackNames ?? true;
 
-  const channels = project.channels;
-  const patterns = project.patterns;
+  const arr = project.arrangements.find((a) => a.id === arrangementId);
+  const lanes = collectLanes(project, arrangementId);
 
-  const allNotes = patterns.flatMap((p) => p.notes);
-  const notesByChannel = new Map<number, Note[]>();
-  for (const note of allNotes) {
-    const list = notesByChannel.get(note.channel_iid) ?? [];
-    list.push(note);
-    notesByChannel.set(note.channel_iid, list);
+  // Bucket lanes by family.
+  const byFamily = new Map<GroupKey, Lane[]>();
+  for (const lane of lanes.values()) {
+    const list = byFamily.get(lane.group.key) ?? [];
+    list.push(lane);
+    byFamily.set(lane.group.key, list);
+  }
+  for (const list of byFamily.values()) {
+    list.sort((a, b) => a.sortKey - b.sortKey);
   }
 
-  const channelMutations: ChannelMutation[] = [];
-  const insertMutations: InsertMutation[] = [];
-  const iidToGroup = new Map<number, Group>();
-  const usedNames = new Map<string, number>();
-  let nextInsert = 1;
-
-  for (const ch of channels) {
-    if (ch.enabled === false) continue;
-    let group = classifyChannel(ch.name, ch.sample_path);
-    if (group === null) {
-      group =
-        classifyByPitchRange(notesByChannel.get(ch.iid) ?? []) ?? GROUPS["synth"]!;
+  // Build the track-layout sequence.
+  const trackMutations: TrackMutation[] = [];
+  const laneToTrackIndex = new Map<string, number>();
+  let cursor = 0;
+  for (const family of FAMILY_ORDER) {
+    const familyLanes = byFamily.get(family);
+    if (!familyLanes || familyLanes.length === 0) continue;
+    if (addSeparators) {
+      const fam = FAMILY_LABELS[family];
+      trackMutations.push({
+        trackIndex: cursor,
+        name: `[${fam.label}]`,
+        rgb: fam.rgb,
+        grouped: false,
+        isFamilySeparator: true,
+      });
+      cursor += 1;
     }
-    iidToGroup.set(ch.iid, group);
-
-    let semanticName = group.name;
-    if (preserveExisting && ch.name && !isDefaultName(ch.name)) {
-      semanticName = ch.name;
-    } else {
-      const used = (usedNames.get(group.name) ?? 0) + 1;
-      usedNames.set(group.name, used);
-      semanticName = used === 1 ? group.name : `${group.name} ${used}`;
+    for (const lane of familyLanes) {
+      const existing = arr?.tracks[cursor];
+      const keepName =
+        preserveNames && existing?.name && !isDefaultTrackName(existing.name);
+      trackMutations.push({
+        trackIndex: cursor,
+        name: keepName ? undefined : lane.displayName,
+        rgb: lane.group.rgb,
+        grouped: false,
+        namePreserved: !!keepName,
+      });
+      laneToTrackIndex.set(`${lane.kind}:${lane.refId}`, cursor);
+      cursor += 1;
     }
-
-    channelMutations.push({
-      iid: ch.iid,
-      name: semanticName,
-      rgb: group.rgb,
-      target_insert: nextInsert,
-    });
-    insertMutations.push({
-      index: nextInsert,
-      name: semanticName,
-      rgb: group.rgb,
-    });
-    nextInsert += 1;
   }
 
-  const patternMutations: PatternMutation[] = [];
-  for (const pat of patterns) {
-    const votes = new Map<GroupKey, number>();
-    for (const note of pat.notes) {
-      const g = iidToGroup.get(note.channel_iid);
-      if (g) votes.set(g.key, (votes.get(g.key) ?? 0) + 1);
-    }
-    if (votes.size === 0) continue;
-    let winnerKey: GroupKey = "lead";
-    let max = -1;
-    for (const [k, v] of votes) {
-      if (v > max) {
-        max = v;
-        winnerKey = k;
+  // Generate clip moves: every clip → the track its lane was assigned.
+  // moveClip is BULK — a single call patches every record matching
+  // {track_index, ref_id, kind}. Emitting per-clip mutations would
+  // cause the 2nd+ call on the same (fromTrack, refId, kind) tuple to
+  // throw EVENT_NOT_FOUND because the match is already gone. Dedupe
+  // here so each unique (fromTrack, refId, kind) becomes ONE move.
+  const clipMoves: ClipMoveMutation[] = [];
+  if (arr) {
+    const TRACK_MAX = 499; // mirrors mutations/index.ts
+    const seen = new Set<string>();
+    for (const lane of lanes.values()) {
+      const target = laneToTrackIndex.get(`${lane.kind}:${lane.refId}`);
+      if (target === undefined) continue;
+      for (const idx of lane.clipIndices) {
+        const clip = arr.clips[idx]!;
+        const fromTrack = TRACK_MAX - clip.track_rvidx;
+        if (fromTrack === target) continue; // already in place
+        const moveKey = `${fromTrack}|${lane.kind}|${lane.refId}`;
+        if (seen.has(moveKey)) continue;
+        seen.add(moveKey);
+        clipMoves.push({
+          fromTrackIndex: fromTrack,
+          // fromPositionTicks is informational — moveClip's match
+          // omits position so it sweeps every clip on this track for
+          // this lane in one call.
+          fromPositionTicks: clip.position,
+          refId: lane.refId,
+          refKind: lane.kind,
+          toTrackIndex: target,
+        });
       }
     }
-    const winner = Object.values(GROUPS).find((g) => g.key === winnerKey)!;
-
-    const newName =
-      renameDefaults && isDefaultName(pat.name) ? winner.name : undefined;
-
-    patternMutations.push({
-      iid: pat.id,
-      name: newName,
-      rgb: winner.rgb,
-    });
   }
 
-  return {
-    channels: channelMutations,
-    inserts: insertMutations,
-    patterns: patternMutations,
-  };
+  return { arrangementId, tracks: trackMutations, clipMoves };
 }
 
 // --------------------------------------------------------------------------- //
@@ -314,48 +429,57 @@ export function planReorganize(
 // --------------------------------------------------------------------------- //
 
 /** Apply a `ReorganizePlan` to an `FLPProject`. Returns a new project. */
-export function applyReorganize(
-  project: FLPProject,
-  plan: ReorganizePlan,
-): FLPProject {
+export function applyReorganize(project: FLPProject, plan: ReorganizePlan): FLPProject {
   let p = project;
-  for (const ch of plan.channels) {
-    p = setChannelName(p, ch.iid, ch.name);
-    p = setChannelColor(p, ch.iid, asRGBA(ch.rgb));
-    p = setChannelRouting(p, ch.iid, ch.target_insert);
+  // Move clips first — moveClip matches on current position+track, which
+  // would shift if we touched track names/colors first (it doesn't, but
+  // ordering is cleaner this way semantically).
+  for (const mv of plan.clipMoves) {
+    // Match by (track, ref_id, kind) only — moveClip is bulk and our
+    // plan already deduplicated to one move per (fromTrack, ref, kind).
+    p = moveClip(
+      p,
+      plan.arrangementId,
+      {
+        track_index: mv.fromTrackIndex,
+        ref_id: mv.refId,
+        kind: mv.refKind,
+      },
+      { track_index: mv.toTrackIndex },
+    );
   }
-  for (const ins of plan.inserts) {
-    p = setInsertName(p, ins.index, ins.name);
-    p = setInsertColor(p, ins.index, asRGBA(ins.rgb));
-  }
-  for (const pat of plan.patterns) {
-    if (pat.name) p = setPatternName(p, pat.iid, pat.name);
-    p = setPatternColor(p, pat.iid, asRGBA(pat.rgb));
+  for (const t of plan.tracks) {
+    if (t.name !== undefined) p = setTrackName(p, plan.arrangementId, t.trackIndex, t.name);
+    if (t.rgb !== undefined) {
+      p = setTrackColor(p, plan.arrangementId, t.trackIndex, {
+        r: t.rgb.r,
+        g: t.rgb.g,
+        b: t.rgb.b,
+        a: 0,
+      });
+    }
+    if (t.grouped !== undefined) {
+      p = setTrackGrouped(p, plan.arrangementId, t.trackIndex, t.grouped);
+    }
   }
   return p;
 }
 
-function asRGBA(rgb: { r: number; g: number; b: number }): RGBA {
-  return { r: rgb.r, g: rgb.g, b: rgb.b, a: 0 };
-}
-
 /**
  * One-shot: plan + apply atomically. Returns the mutated project plus
- * the plan (callers may want the plan for reporting/dry-run).
+ * the plan and a count of mutations actually applied.
  */
 export function reorganizeProject(
   project: FLPProject,
   options: ReorganizeOptions = {},
 ): { project: FLPProject; plan: ReorganizePlan; mutationsApplied: number } {
   const plan = planReorganize(project, options);
-  const mutationsApplied =
-    plan.channels.length * 3 +
-    plan.inserts.length * 2 +
-    plan.patterns.reduce((acc, p) => acc + (p.name ? 2 : 1), 0);
+  const trackMuts = plan.tracks.reduce(
+    (acc, t) =>
+      acc + (t.name !== undefined ? 1 : 0) + (t.rgb !== undefined ? 1 : 0) + (t.grouped !== undefined ? 1 : 0),
+    0,
+  );
+  const mutationsApplied = trackMuts + plan.clipMoves.length;
   const mutated = applyReorganize(project, plan);
   return { project: mutated, plan, mutationsApplied };
 }
-
-// Shut up unused-import lint in setups that strip the type re-export.
-const _UnusedTypes: Channel | Pattern | undefined = undefined;
-void _UnusedTypes;

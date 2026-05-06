@@ -63,7 +63,7 @@ import {
   type ClipPlacement,
   type ClipMatch,
 } from "./mutations/index.ts";
-import { reorganizeProject } from "./reorganize/index.ts";
+import { planReorganize, reorganizeProject } from "./reorganize/index.ts";
 
 type BridgeRequest = {
   kind: string;
@@ -246,8 +246,9 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   ]),
   reorganize_project: new Set([
     "path",
-    "preserve_existing_names",
-    "rename_default_patterns",
+    "arrangement",
+    "add_family_separators",
+    "preserve_existing_track_names",
     "dry_run",
   ]),
 };
@@ -516,35 +517,47 @@ function executeWrite(
       }
       mutated = clonePattern(project, iid, newName);
     } else if (kind === "reorganize_project") {
-      // Atomic Ableton-style reorganize: classify channels by name +
-      // sample path, route each to its own insert, apply palette
-      // colors per group, recolor patterns by dominant channel.
-      // Returns the plan even when applying so callers can audit.
-      const preserveExisting = args["preserve_existing_names"];
-      const renameDefaults = args["rename_default_patterns"];
+      // Playlist-only Ableton-style reorganize: classify each clip by
+      // its referenced channel/pattern, lay tracks out in family
+      // blocks ([Drums], [Bass], …), move clips to their target
+      // tracks, set track name + color. NEVER touches channels,
+      // mixer inserts, or patterns — those carry intentional engineering.
+      const arrId = Number(args["arrangement"] ?? 0);
+      const addSep = args["add_family_separators"];
+      const preserveTrackNames = args["preserve_existing_track_names"];
       const dryRun = args["dry_run"];
-      if (preserveExisting !== undefined && typeof preserveExisting !== "boolean") {
+      if (!Number.isFinite(arrId) || arrId < 0) {
         throw new MutationError(
           "INVALID_ARGS",
-          "args.preserve_existing_names must be boolean when provided",
+          "args.arrangement must be a non-negative integer",
         );
       }
-      if (renameDefaults !== undefined && typeof renameDefaults !== "boolean") {
+      if (addSep !== undefined && typeof addSep !== "boolean") {
         throw new MutationError(
           "INVALID_ARGS",
-          "args.rename_default_patterns must be boolean when provided",
+          "args.add_family_separators must be boolean when provided",
+        );
+      }
+      if (preserveTrackNames !== undefined && typeof preserveTrackNames !== "boolean") {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.preserve_existing_track_names must be boolean when provided",
         );
       }
       if (dryRun !== undefined && typeof dryRun !== "boolean") {
         throw new MutationError("INVALID_ARGS", "args.dry_run must be boolean when provided");
       }
 
-      const result = reorganizeProject(project, {
-        preserveExistingNames: preserveExisting as boolean | undefined,
-        renameDefaultPatterns: renameDefaults as boolean | undefined,
-      });
+      const opts = {
+        arrangementId: arrId,
+        addFamilySeparators: addSep as boolean | undefined,
+        preserveExistingTrackNames: preserveTrackNames as boolean | undefined,
+      };
 
       if (dryRun === true) {
+        // Plan only — never call applyReorganize (its moveClip can throw
+        // when the project's clip layout is unusual; dry-run must be safe).
+        const plan = planReorganize(project, opts);
         return {
           ok: true,
           kind,
@@ -552,10 +565,11 @@ function executeWrite(
             path: resolve(path),
             dry_run: true,
             mutations_applied: 0,
-            plan: result.plan,
+            plan,
           },
         };
       }
+      const result = reorganizeProject(project, opts);
       mutated = result.project;
       const bytes = serializeFLPProject(mutated);
       writeFileSync(resolve(path), bytes);

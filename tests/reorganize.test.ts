@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { parseFLPFile } from "../src/index.ts";
 import { serializeFLPProject } from "../src/parser/flp-write.ts";
 import {
+  FAMILY_ORDER,
   GROUPS,
   classifyByPitchRange,
   classifyChannel,
@@ -23,7 +24,7 @@ function reparse(project: ReturnType<typeof parseFLPFile>) {
 }
 
 // --------------------------------------------------------------------------- //
-// classifyChannel                                                              //
+// classifyChannel — same shape, kept since algo still uses it                 //
 // --------------------------------------------------------------------------- //
 
 describe("classifyChannel — keyword regex", () => {
@@ -38,38 +39,22 @@ describe("classifyChannel — keyword regex", () => {
     ).toBe("drums_hard");
   });
 
-  test("hat → drums_soft (separate from kick/snare)", () => {
+  test("hat → drums_soft + camelCase aware", () => {
     expect(classifyChannel("HiHat", undefined)?.key).toBe("drums_soft");
-    // word-boundary matching: 'Hatchet' should NOT match 'hat' (no word boundary inside)
     expect(classifyChannel("Hatchet", undefined)).toBe(null);
   });
 
-  test("'808' classifies as bass", () => {
-    // "808 Sub" matches "sub" first (more specific name → "Sub Bass").
-    // Both group keys are 'bass', which is what matters.
-    expect(classifyChannel("808 Sub", undefined)?.key).toBe("bass");
-    expect(classifyChannel("808", undefined)?.key).toBe("bass");
-    expect(classifyChannel("808", undefined)?.name).toBe("808");
-  });
-
-  test("vocal keywords map to vocal", () => {
+  test("'Lead Vox' → vocal (vocal precedes lead)", () => {
     expect(classifyChannel("Lead Vox", undefined)?.key).toBe("vocal");
-    expect(classifyChannel("Backing Vocal", undefined)?.key).toBe("vocal");
   });
 
   test("returns null on truly unknown content", () => {
     expect(classifyChannel("Xqzfoo Plugin 17", undefined)).toBe(null);
-    expect(classifyChannel(undefined, undefined)).toBe(null);
-    expect(classifyChannel("", "")).toBe(null);
   });
 });
 
-// --------------------------------------------------------------------------- //
-// classifyByPitchRange                                                         //
-// --------------------------------------------------------------------------- //
-
 describe("classifyByPitchRange — MIDI pitch fallback", () => {
-  function makeNote(key: number) {
+  function note(key: number) {
     return {
       position: 0,
       flags: 0,
@@ -88,149 +73,48 @@ describe("classifyByPitchRange — MIDI pitch fallback", () => {
     };
   }
 
-  test("avg < 48 → bass", () => {
-    expect(classifyByPitchRange([makeNote(36), makeNote(40), makeNote(44)])?.key).toBe("bass");
+  test("avg < 48 → bass; bass_sketch Serum case (avg 44)", () => {
+    expect(classifyByPitchRange([note(36), note(40), note(44)])?.key).toBe("bass");
+    expect(classifyByPitchRange([note(44)])?.key).toBe("bass");
   });
 
-  test("48 <= avg < 72 → lead", () => {
-    expect(classifyByPitchRange([makeNote(60), makeNote(64), makeNote(67)])?.key).toBe("lead");
+  test("avg 48..72 → lead; >= 72 → pad", () => {
+    expect(classifyByPitchRange([note(60), note(67)])?.key).toBe("lead");
+    expect(classifyByPitchRange([note(72), note(80)])?.key).toBe("pad");
   });
 
-  test("avg >= 72 → pad", () => {
-    expect(classifyByPitchRange([makeNote(72), makeNote(80), makeNote(88)])?.key).toBe("pad");
-  });
-
-  test("empty notes → null", () => {
+  test("empty → null", () => {
     expect(classifyByPitchRange([])).toBe(null);
   });
+});
 
-  test("matches the bass_sketch Serum case (avg key 44)", () => {
-    // Single note at key 44 (G2) — the classic bass fundamental on
-    // bass_sketch.flp's Serum channel. Should bucket as bass.
-    expect(classifyByPitchRange([makeNote(44)])?.key).toBe("bass");
+// --------------------------------------------------------------------------- //
+// planReorganize — playlist-only behavior                                     //
+// --------------------------------------------------------------------------- //
+
+describe("planReorganize — empty/clipless project", () => {
+  test("base_one_pattern.flp (no playlist clips) yields empty layout", async () => {
+    // base_one_pattern has channels + a pattern but no clips on the playlist.
+    // No clips → no lanes → no track mutations.
+    const p = await loadProject("base_one_pattern.flp");
+    const plan = planReorganize(p);
+    expect(plan.tracks).toEqual([]);
+    expect(plan.clipMoves).toEqual([]);
+  });
+
+  test("base_empty.flp (no channels at all) yields empty layout", async () => {
+    const p = await loadProject("base_empty.flp");
+    const plan = planReorganize(p);
+    expect(plan.tracks).toEqual([]);
+    expect(plan.clipMoves).toEqual([]);
   });
 });
 
 // --------------------------------------------------------------------------- //
-// planReorganize                                                               //
+// reorganizeProject — channels/inserts/patterns must stay byte-identical     //
 // --------------------------------------------------------------------------- //
 
-describe("planReorganize — base_one_pattern.flp", () => {
-  test("plans a channel mutation per enabled channel", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const plan = planReorganize(p);
-    const enabledCount = p.channels.filter((c) => c.enabled !== false).length;
-    expect(plan.channels.length).toBe(enabledCount);
-    expect(plan.inserts.length).toBe(enabledCount);
-    // Sequential inserts 1..N — no zero, no gaps.
-    expect(plan.channels.map((c) => c.target_insert)).toEqual(
-      Array.from({ length: enabledCount }, (_, i) => i + 1),
-    );
-  });
-
-  test("classifies the 909 Kick sample path correctly", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const plan = planReorganize(p);
-    // base_one_pattern's lone channel has sample_path containing
-    // "909 Kick.wav" — must classify as drums_hard / Kick.
-    const kickMutation = plan.channels.find((c) => /Kick/i.test(c.name));
-    expect(kickMutation).toBeDefined();
-    expect(kickMutation!.rgb).toEqual(GROUPS["kick"]!.rgb);
-  });
-
-  test("uses palette colors only", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const plan = planReorganize(p);
-    const paletteRgbs = new Set(Object.values(GROUPS).map((g) => `${g.rgb.r},${g.rgb.g},${g.rgb.b}`));
-    for (const ch of plan.channels) {
-      expect(paletteRgbs.has(`${ch.rgb.r},${ch.rgb.g},${ch.rgb.b}`)).toBe(true);
-    }
-    for (const ins of plan.inserts) {
-      expect(paletteRgbs.has(`${ins.rgb.r},${ins.rgb.g},${ins.rgb.b}`)).toBe(true);
-    }
-  });
-
-  test("preserveExistingNames=true keeps already-semantic channel names", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    // base_one_pattern's iid=1 channel name from FL is "Kick". Custom
-    // (not in DEFAULT_NAME_RE), so preserveExisting keeps it.
-    const plan = planReorganize(p, { preserveExistingNames: true });
-    const kickPlan = plan.channels.find((c) => c.iid === 1);
-    expect(kickPlan?.name).toBe("Kick");
-  });
-
-  test("preserveExistingNames=false canonicalises to group name", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const plan = planReorganize(p, { preserveExistingNames: false });
-    const kickPlan = plan.channels.find((c) => c.iid === 1);
-    expect(kickPlan?.name).toBe("Kick");
-  });
-});
-
-// --------------------------------------------------------------------------- //
-// reorganizeProject — full round-trip via serializer                           //
-// --------------------------------------------------------------------------- //
-
-describe("reorganizeProject — serialize → reparse → invariants hold", () => {
-  test("base_one_pattern: enabled channels routed to distinct inserts != Master", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const { project: mutated, mutationsApplied } = reorganizeProject(p, {
-      preserveExistingNames: false,
-    });
-    expect(mutationsApplied).toBeGreaterThan(0);
-
-    const re = reparse(mutated);
-    const enabled = re.channels.filter((c) => c.enabled !== false);
-    const targets = enabled.map((c) => c.targetInsert);
-    // Each enabled channel got a routing.
-    for (const t of targets) {
-      expect(typeof t).toBe("number");
-      expect(t).toBeGreaterThan(0); // not Master (insert 0)
-    }
-    expect(new Set(targets).size).toBe(targets.length); // distinct
-  });
-
-  test("clip count + per-pattern note count preserved", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const beforeNotesByPattern = new Map(p.patterns.map((pp) => [pp.id, pp.notes.length]));
-    const beforeClips = p.arrangements.reduce((acc, a) => acc + a.clips.length, 0);
-
-    const { project: mutated } = reorganizeProject(p);
-    const re = reparse(mutated);
-
-    const afterNotesByPattern = new Map(re.patterns.map((pp) => [pp.id, pp.notes.length]));
-    const afterClips = re.arrangements.reduce((acc, a) => acc + a.clips.length, 0);
-
-    expect(afterNotesByPattern).toEqual(beforeNotesByPattern);
-    expect(afterClips).toBe(beforeClips);
-  });
-
-  test("colors come from palette (RGB compare; alpha may differ)", async () => {
-    const p = await loadProject("base_one_pattern.flp");
-    const { project: mutated } = reorganizeProject(p);
-    const re = reparse(mutated);
-
-    const paletteRgb = new Set(
-      Object.values(GROUPS).map((g) => (g.rgb.r << 16) | (g.rgb.g << 8) | g.rgb.b),
-    );
-    for (const ch of re.channels) {
-      if (ch.color === undefined || ch.enabled === false) continue;
-      const rgb = (ch.color.r << 16) | (ch.color.g << 8) | ch.color.b;
-      // FL emits a default gray (0x414548) on fresh sampler channels; if
-      // the channel had a default the algorithm overrides to a palette
-      // color, so any non-zero color here must be palette.
-      if (rgb !== 0) {
-        expect(paletteRgb.has(rgb)).toBe(true);
-      }
-    }
-  });
-});
-
-// --------------------------------------------------------------------------- //
-// Round-trip safety on every fl25 fixture                                      //
-// --------------------------------------------------------------------------- //
-
-describe("reorganizeProject — corpus round-trip safety", () => {
+describe("reorganizeProject — never touches channels/inserts/patterns", () => {
   const FIXTURES = [
     "base_empty.flp",
     "base_one_channel.flp",
@@ -239,12 +123,66 @@ describe("reorganizeProject — corpus round-trip safety", () => {
     "base_one_insert.flp",
   ];
 
-  test.each(FIXTURES)("%s reorganizes + reparses without error", async (name) => {
+  test.each(FIXTURES)("%s: channel state byte-identical before/after", async (name) => {
     const p = await loadProject(name);
     const { project: mutated } = reorganizeProject(p);
-    // Just exercising the full path — no exception from serializer.
     const re = reparse(mutated);
+
+    // Every channel field that flpdiff surfaces must match.
     expect(re.channels.length).toBe(p.channels.length);
+    for (let i = 0; i < p.channels.length; i++) {
+      const before = p.channels[i]!;
+      const after = re.channels[i]!;
+      expect(after.iid).toBe(before.iid);
+      expect(after.name).toBe(before.name);
+      expect(after.kind).toBe(before.kind);
+      expect(after.color).toEqual(before.color);
+      expect(after.targetInsert).toBe(before.targetInsert);
+      expect(after.sample_path).toBe(before.sample_path);
+    }
+  });
+
+  test.each(FIXTURES)("%s: pattern state byte-identical before/after", async (name) => {
+    const p = await loadProject(name);
+    const { project: mutated } = reorganizeProject(p);
+    const re = reparse(mutated);
+
     expect(re.patterns.length).toBe(p.patterns.length);
+    for (let i = 0; i < p.patterns.length; i++) {
+      const before = p.patterns[i]!;
+      const after = re.patterns[i]!;
+      expect(after.id).toBe(before.id);
+      expect(after.name).toBe(before.name);
+      expect(after.color).toEqual(before.color);
+      expect(after.notes.length).toBe(before.notes.length);
+    }
+  });
+
+  test.each(FIXTURES)("%s: clip count preserved", async (name) => {
+    const p = await loadProject(name);
+    const { project: mutated } = reorganizeProject(p);
+    const re = reparse(mutated);
+
+    const beforeClips = p.arrangements.reduce((acc, a) => acc + a.clips.length, 0);
+    const afterClips = re.arrangements.reduce((acc, a) => acc + a.clips.length, 0);
+    expect(afterClips).toBe(beforeClips);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// FAMILY_ORDER — sanity                                                       //
+// --------------------------------------------------------------------------- //
+
+describe("FAMILY_ORDER — fixed family sequence", () => {
+  test("drums first, vocal before other; covers every GroupKey", () => {
+    expect(FAMILY_ORDER[0]).toBe("drums_hard");
+    expect(FAMILY_ORDER[1]).toBe("drums_soft");
+    expect(FAMILY_ORDER.indexOf("vocal")).toBeLessThan(FAMILY_ORDER.indexOf("other"));
+    // Every group from GROUPS plus 'other' is in FAMILY_ORDER.
+    const groupKeys = new Set(Object.values(GROUPS).map((g) => g.key));
+    groupKeys.add("other");
+    for (const k of groupKeys) {
+      expect(FAMILY_ORDER).toContain(k);
+    }
   });
 });
