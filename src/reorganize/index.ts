@@ -143,7 +143,11 @@ export const FAMILY_LABELS: Record<GroupKey, { label: string; rgb: { r: number; 
   drums_hard: { label: "Drums", rgb: PALETTE_DRUMS_HARD },
   drums_soft: { label: "Drums (Soft)", rgb: PALETTE_DRUMS_SOFT },
   bass: { label: "Bass", rgb: PALETTE_BASS },
-  lead: { label: "Lead", rgb: PALETTE_LEAD },
+  // "Synth" rather than "Lead" because the family covers any
+  // melodic instrument when we can't identify a specific role
+  // (lead / melody / arp / piano keywords still set a per-track
+  // name; the family separator stays generic).
+  lead: { label: "Synth", rgb: PALETTE_LEAD },
   pad: { label: "Pad", rgb: PALETTE_PAD },
   fx: { label: "FX", rgb: PALETTE_FX },
   vocal: { label: "Vocal", rgb: PALETTE_VOCAL },
