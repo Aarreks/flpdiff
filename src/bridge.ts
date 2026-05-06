@@ -63,6 +63,7 @@ import {
   type ClipPlacement,
   type ClipMatch,
 } from "./mutations/index.ts";
+import { reorganizeProject } from "./reorganize/index.ts";
 
 type BridgeRequest = {
   kind: string;
@@ -114,6 +115,7 @@ const WRITE_KINDS = new Set([
   "add_clip",
   "remove_clip",
   "move_clip",
+  "reorganize_project",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -241,6 +243,12 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "kind",
     "to_track_index",
     "to_position_ticks",
+  ]),
+  reorganize_project: new Set([
+    "path",
+    "preserve_existing_names",
+    "rename_default_patterns",
+    "dry_run",
   ]),
 };
 
@@ -507,6 +515,60 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "args.name must be a string when provided");
       }
       mutated = clonePattern(project, iid, newName);
+    } else if (kind === "reorganize_project") {
+      // Atomic Ableton-style reorganize: classify channels by name +
+      // sample path, route each to its own insert, apply palette
+      // colors per group, recolor patterns by dominant channel.
+      // Returns the plan even when applying so callers can audit.
+      const preserveExisting = args["preserve_existing_names"];
+      const renameDefaults = args["rename_default_patterns"];
+      const dryRun = args["dry_run"];
+      if (preserveExisting !== undefined && typeof preserveExisting !== "boolean") {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.preserve_existing_names must be boolean when provided",
+        );
+      }
+      if (renameDefaults !== undefined && typeof renameDefaults !== "boolean") {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.rename_default_patterns must be boolean when provided",
+        );
+      }
+      if (dryRun !== undefined && typeof dryRun !== "boolean") {
+        throw new MutationError("INVALID_ARGS", "args.dry_run must be boolean when provided");
+      }
+
+      const result = reorganizeProject(project, {
+        preserveExistingNames: preserveExisting as boolean | undefined,
+        renameDefaultPatterns: renameDefaults as boolean | undefined,
+      });
+
+      if (dryRun === true) {
+        return {
+          ok: true,
+          kind,
+          result: {
+            path: resolve(path),
+            dry_run: true,
+            mutations_applied: 0,
+            plan: result.plan,
+          },
+        };
+      }
+      mutated = result.project;
+      const bytes = serializeFLPProject(mutated);
+      writeFileSync(resolve(path), bytes);
+      return {
+        ok: true,
+        kind,
+        result: {
+          path: resolve(path),
+          bytes_written: bytes.byteLength,
+          mutations_applied: result.mutationsApplied,
+          plan: result.plan,
+        },
+      };
     } else {
       return {
         ok: false,
