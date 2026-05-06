@@ -288,11 +288,19 @@ offset  size  field            notes
 34-37   u32   queued           4-byte bool
 38-41   u32   tolerant         4-byte bool
 42-45   u32   position_sync    enum
-46      u8    ?                 PyFLP doesn't name this byte
-47      u8    grouped          "grouped with track above" Boolean
-48      u8    locked
-49+     ?     trailing          undocumented
+46      u8    grouped          "grouped with track above" Boolean
+47      u8    locked           "lock to content" Boolean
+48+     ?     trailing          undocumented
 ```
+
+**Off-by-one fixed 2026-05-07.** PyFLP's struct comments use cumulative
+END offsets, not start offsets. Earlier flpdiff builds had `grouped`
+at byte 47 and `locked` at byte 48, which silently flipped the wrong
+flag — FL UI showed "Lock to content" enabled instead of "Group with
+above track" on every reorganized auto track. Fixed in flpdiff@8c26f16
+after Roman caught the symptom in FL's track menu. See
+`docs/mutations-gotchas.md` section 8 for the general rule about
+porting PyFLP struct definitions.
 
 ### FL UI parent-inference rule
 

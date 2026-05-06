@@ -171,7 +171,43 @@ traverse via `describe["mixer"]["inserts"]`.
 
 (Decision D-42.)
 
-## 8. Prefer rule-based logic over LLM for invariant-checkable tasks
+## 8. PyFLP `c.Struct` field comments are CUMULATIVE END offsets, not starts
+
+A high-impact off-by-one we hit during reorganize v3. PyFLP source
+defines the playlist `TrackEvent` like this:
+
+```python
+STRUCT = c.Struct(
+    "iid" / c.Optional(c.Int32ul),                    # 4
+    "color" / c.Optional(c.Int32ul),                  # 8
+    "icon" / c.Optional(c.Int32ul),                   # 12
+    ...
+    "position_sync" / c.Optional(StdEnum[...](c.Int32ul)),  # 46
+    "grouped" / c.Optional(c.Flag),                   # 47   ← byte 46!
+    "locked" / c.Optional(c.Flag),                    # 48   ← byte 47!
+)
+```
+
+Each `# N` comment is the **end** offset of that field — i.e. the
+total bytes consumed up through and including that field. So the
+field actually starts at the previous field's end-offset.
+
+We read those comments as start offsets and shipped a parser/encoder
+that toggled `locked` whenever asked to toggle `grouped`. FL UI on the
+output showed "Lock to content" enabled instead of "Group with above
+track" — caught in live-FL verify on 2026-05-07.
+
+**Rule:** when porting a PyFLP `c.Struct` definition, ALWAYS:
+
+1. Compute cumulative byte offsets explicitly (sum the `c.IntNN` /
+   `c.Bytes(K)` sizes top-down) before referencing any byte by index
+2. Cross-check the resulting layout against a real fixture's bytes
+3. If a struct uses `c.Optional`, remember those fields can still
+   occupy bytes when present — `c.Optional` doesn't make them shorter
+
+(Decision D-45.)
+
+## 9. Prefer rule-based logic over LLM for invariant-checkable tasks
 
 If a task's success criteria can be expressed as a programmatic
 invariant set (palette colors, naming conventions, routing
