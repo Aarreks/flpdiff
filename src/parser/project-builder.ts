@@ -44,6 +44,14 @@ const OP_CHANNEL_ROUTED_TO = 0x16;
  * `decodeAutomationPoints` for automation-kind channels.
  */
 const OP_CHANNEL_AUTOMATION = 0xea;
+/**
+ * RemoteController link, DATA+19 = 0xE3. Carries the
+ * automation-channel → target-parameter binding. See
+ * `docs/fl-format/fl25-event-format.md` for the 20-byte layout.
+ * Used to nest automation tracks under the channel they automate
+ * during playlist reorganize.
+ */
+const OP_REMOTE_CONTROLLER = 0xe3;
 const OP_CHANNEL_SAMPLE_PATH = 0xc4;
 /** Plugin internal-class name (UTF-16LE). On a bare sampler channel
  *  FL emits this as an empty string. */
@@ -587,6 +595,52 @@ export function buildChannels(
         ch.name = decodeTextEvent(ev.payload, legacy);
         break;
       }
+    }
+  }
+
+  // Second pass: 0xE3 RemoteController events live at project scope
+  // (NOT inside channel blocks), so we sweep all events and attach
+  // each by `source_iid` (bytes 2-3) to the matching automation
+  // channel. Then resolve `automationTarget.kind` against the known
+  // channel-iid set. See `docs/fl-format/fl25-event-format.md` for
+  // the 20-byte payload layout.
+  const channelByIid = new Map<number, Channel>();
+  for (const c of channels) channelByIid.set(c.iid, c);
+  for (const ev of events) {
+    if (ev.opcode !== OP_REMOTE_CONTROLLER || ev.kind !== "blob") continue;
+    if (ev.payload.byteLength < 12) continue;
+    const view = new DataView(ev.payload.buffer, ev.payload.byteOffset, ev.payload.byteLength);
+    const sourceIid = view.getUint16(2, true);
+    const ch = channelByIid.get(sourceIid);
+    // Only attach to automation channels — the same opcode is also
+    // used for project-level MIDI/remote-control mappings (e.g. in
+    // `nucleon-orbit.flp`), and those don't correspond to a
+    // channel-rack slot.
+    if (!ch || ch.kind !== "automation" || ch.automationTarget !== undefined) continue;
+    const paramData = view.getUint16(8, true);
+    const rawDestination = view.getUint16(10, true);
+    ch.automationTarget = {
+      kind: "unknown",
+      paramId: paramData & 0x7fff,
+      isVstParam: (paramData & 0x8000) !== 0,
+      rawDestination,
+    };
+  }
+
+  // Third pass: resolve `kind` now that every channel iid is known.
+  // Small u16 destinations matching an existing channel iid are
+  // direct channel-targeted automations (the case we render as a
+  // nested track). Larger values (>= 0x1000) are mixer-slot
+  // encodings; flpdiff doesn't decode those yet.
+  const channelIids = new Set(channels.map((c) => c.iid));
+  for (const ch of channels) {
+    const target = ch.automationTarget;
+    if (!target) continue;
+    if (target.rawDestination < 0x1000 && channelIids.has(target.rawDestination)) {
+      target.kind = "channel";
+      target.targetChannelIid = target.rawDestination;
+    } else if (target.rawDestination >= 0x1000) {
+      target.kind = "mixer_slot";
     }
   }
 

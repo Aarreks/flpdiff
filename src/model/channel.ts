@@ -223,6 +223,38 @@ export type Channel = {
    * channels with no points written).
    */
   automationPoints?: AutomationPoint[];
+  /**
+   * For automation-kind channels: what does this automation control?
+   * Decoded from opcode `0xE3` (RemoteController, DATA+19, see
+   * `docs/fl-format/fl25-event-format.md`).
+   *
+   * - `kind: "channel"` → controls a parameter on `targetChannelIid`
+   *   directly. The most common case (and the one we render as a
+   *   nested track in playlist reorganize).
+   * - `kind: "mixer_slot"` → controls a parameter on a plugin in a
+   *   mixer-insert slot. The destination encoding is more complex
+   *   (packs insert+slot indices) and we don't decode it yet —
+   *   `targetChannelIid` is undefined.
+   * - `kind: "unknown"` → 0xE3 was present but the destination
+   *   doesn't match any known channel iid and doesn't fit the
+   *   mixer-slot-encoding heuristic.
+   *
+   * Absent for non-automation channels (and for automations on FLPs
+   * that don't emit a `0xE3` — i.e. unlinked automations).
+   */
+  automationTarget?: AutomationTarget;
+};
+
+export type AutomationTarget = {
+  kind: "channel" | "mixer_slot" | "unknown";
+  /** Set only when `kind === "channel"` and the destination matches a real `Channel.iid`. */
+  targetChannelIid?: number;
+  /** Parameter id within the target plugin/object. Bytes 8-9 of the 0xE3 payload, lower 15 bits. */
+  paramId: number;
+  /** True when the target parameter belongs to a VST plugin (high bit of bytes 8-9). */
+  isVstParam: boolean;
+  /** Raw destination uint16 (bytes 10-11). Useful for forensic logging when `kind` falls back to mixer_slot/unknown. */
+  rawDestination: number;
 };
 
 /**

@@ -197,6 +197,77 @@ fixed-offset RE approach that worked for EQ 2 doesn't translate.
 Full VST chunk decoding or differential-noise RE is needed;
 deferred.
 
+## `0xE3` RemoteController — automation→target link
+
+Opcode `0xE3` = DATA + 19 in PyFLP's enum scheme. PyFLP's
+`RemoteControllerEvent` knows about this event but its `STRUCT` does
+NOT decode the destination/parameter binding (only `parameter_data`
+gets exposed via `RemoteController.parameter`, and even that is
+TODO-tagged in `Channel.controllers`). flpdiff RE'd the rest by
+diffing automation-tagged fixtures against their "nolink" siblings
+(`tests/corpus/local/test_track_color=red;icon=empty;automations=link*.flp`)
+plus surveying every `0xE3` blob across the local corpus.
+
+20-byte payload layout (FL 25):
+
+```
+offset  size  field                meaning
+0-1     u16   _u1                  ~always 0; possibly version flag (saw 1, 2 in legacy)
+2-3     u16   source_iid           the AUTOMATION channel emitting this control
+4-5     u16   _u2                  ~always 0
+6-7     u16   _u3                  often 0; sometimes mirrors source_iid
+8-9     u16   parameter_data       high bit (0x8000) = controls a VST plugin param;
+                                   low 15 bits = parameter id within the target
+10-11   u16   destination          target channel iid (or encoded mixer-slot ref —
+                                   see "When destination is a mixer slot" below)
+12-15   u32   _u4                  ~always 8 (constant magic)
+16-19   u32   _u5                  ~always 469 = 0x1D5 (format marker)
+```
+
+The two payload uints we care about for nesting automation lanes are
+`source_iid` (offset 2) and `destination` (offset 10).
+
+### When destination is a channel
+
+If `destination` is a small u16 that matches an existing
+`Channel.iid` in the project, the automation controls a parameter
+on that channel directly. Example from `automations=link.flp`:
+auto channel iid=3 named `"3x Osc - Osc 1 coarse pitch"` →
+`source_iid=3`, `destination=0`, project has `Channel{iid: 0,
+name: "3x Osc"}`. Round-trips: yes; both bytes literally name the
+linked channel.
+
+### When destination is a mixer slot
+
+Real producer FLPs (`pp4_j1_129`, `h3_ys_64`, `edz_chords_28`)
+have automation channels controlling **mixer-slot plugin
+parameters** — e.g. `"Param. EQ 2 (Slot 7) - Serum - Band 1 freq"`.
+For those, `destination` is large (e.g. 0x24c5, 0x2820) and does
+NOT correspond to a channel iid. The encoding presumably packs
+`{insert_index, slot_index}` together; full decoding deferred.
+
+### How flpdiff uses this
+
+Reorganize v3 (next phase):
+
+1. For every automation channel, look up the matching `0xE3` event by
+   `source_iid == channel.iid` and surface a `Channel.automationTarget`
+   with `kind: "channel" | "unknown"` plus the resolvable channel iid
+   when applicable.
+2. When laying out playlist tracks, place each automation lane
+   *immediately after* its target's lane, with `track.grouped = true`
+   so FL renders the auto as a collapsible child of the instrument.
+3. Automations whose destination is a mixer slot or unknown encoding
+   stay in their own family block (no nesting attempted).
+
+### What's NOT covered
+
+- Mixer-slot destination encoding (defer until needed)
+- The `_u4`/`_u5` magic constants — never seen anything other than
+  `8` and `0x1D5` across 800+ events on the local corpus
+- Multiple linked targets per automation (haven't seen >1 `0xE3`
+  per source_iid in the corpus)
+
 ## Changelog
 
 - **2026-04-16** — Initial version. Tempo at bytes 155-158 as

@@ -207,6 +207,19 @@ type Lane = {
   sortKey: number;
   /** Indices into `arrangement.clips` that belong to this lane. */
   clipIndices: number[];
+  /**
+   * True for automation lanes. When set, the lane will be placed
+   * immediately after its `automationTargetIid` lane (when known) and
+   * rendered as a `grouped=true` child track in FL's playlist.
+   */
+  isAutomation?: boolean;
+  /**
+   * Channel iid of the automation's target instrument, when the auto
+   * directly controls a channel parameter (kind="channel" in
+   * `Channel.automationTarget`). Mixer-slot automations leave this
+   * undefined and stay in their own family block as standalone rows.
+   */
+  automationTargetIid?: number;
 };
 
 export type TrackMutation = {
@@ -302,12 +315,38 @@ function collectLanes(project: FLPProject, arrangementId: number): Map<string, L
       let displayName = "";
       let sortKey = refId;
 
+      let isAutomation = false;
+      let automationTargetIid: number | undefined;
       if (kind === "channel") {
         const ch = channelsByIid.get(refId);
         const chNotes = allNotesByCh.get(refId) ?? [];
         group = classifyChannel(ch?.name, ch?.sample_path) ?? classifyByPitchRange(chNotes);
         displayName = ch?.name?.trim() || `Channel ${refId}`;
         sortKey = refId;
+        // Automation channel that targets another channel directly
+        // → inherit target's family + remember the target so layout
+        // can nest us under that target's track.
+        if (
+          ch?.kind === "automation" &&
+          ch.automationTarget?.kind === "channel" &&
+          ch.automationTarget.targetChannelIid !== undefined
+        ) {
+          isAutomation = true;
+          automationTargetIid = ch.automationTarget.targetChannelIid;
+          const target = channelsByIid.get(automationTargetIid);
+          if (target) {
+            const targetNotes = allNotesByCh.get(target.iid) ?? [];
+            const targetGroup =
+              classifyChannel(target.name, target.sample_path) ??
+              classifyByPitchRange(targetNotes);
+            if (targetGroup) group = targetGroup;
+          }
+        } else if (ch?.kind === "automation") {
+          // Mixer-slot or unknown automation: keep its own
+          // name-based classification but mark as auto so layout
+          // doesn't nest it (no target available).
+          isAutomation = true;
+        }
       } else {
         const pat = patternsById.get(refId);
         const dominantIid = dominantChannelIid(pat?.notes ?? []);
@@ -320,7 +359,16 @@ function collectLanes(project: FLPProject, arrangementId: number): Map<string, L
         sortKey = dominantIid ?? refId + 100_000; // unknown patterns sort last in family
       }
       if (!group) group = OTHER_GROUP;
-      lane = { kind, refId, group, displayName, sortKey, clipIndices: [] };
+      lane = {
+        kind,
+        refId,
+        group,
+        displayName,
+        sortKey,
+        clipIndices: [],
+        isAutomation,
+        automationTargetIid,
+      };
       lanes.set(key, lane);
     }
     lane.clipIndices.push(i);
@@ -349,8 +397,52 @@ export function planReorganize(
     list.push(lane);
     byFamily.set(lane.group.key, list);
   }
-  for (const list of byFamily.values()) {
-    list.sort((a, b) => a.sortKey - b.sortKey);
+
+  // Within each family, order:
+  //   1. Non-auto lanes sorted by sortKey
+  //   2. After each non-auto lane: any auto lanes whose
+  //      automationTargetIid points to this lane's refId,
+  //      sorted by their own sortKey
+  //   3. Standalone autos (mixer-slot / unknown / orphaned) tacked on
+  //      at family end, sorted by sortKey
+  const orderedByFamily = new Map<GroupKey, Lane[]>();
+  for (const [family, list] of byFamily) {
+    const nonAuto = list.filter((l) => !l.isAutomation).sort((a, b) => a.sortKey - b.sortKey);
+    const autosByTarget = new Map<number, Lane[]>();
+    const autoOrphans: Lane[] = [];
+    for (const l of list) {
+      if (!l.isAutomation) continue;
+      if (l.automationTargetIid !== undefined) {
+        const arr = autosByTarget.get(l.automationTargetIid) ?? [];
+        arr.push(l);
+        autosByTarget.set(l.automationTargetIid, arr);
+      } else {
+        autoOrphans.push(l);
+      }
+    }
+    for (const arr of autosByTarget.values()) arr.sort((a, b) => a.sortKey - b.sortKey);
+    autoOrphans.sort((a, b) => a.sortKey - b.sortKey);
+
+    const ordered: Lane[] = [];
+    for (const parent of nonAuto) {
+      if (parent.kind !== "channel") {
+        ordered.push(parent);
+        continue;
+      }
+      ordered.push(parent);
+      const children = autosByTarget.get(parent.refId);
+      if (children) {
+        ordered.push(...children);
+        autosByTarget.delete(parent.refId);
+      }
+    }
+    // Autos whose target lives in a different family (rare but
+    // possible — auto for a "lead" channel ending up in a "bass"
+    // bucket because the auto's name regex misclassified) get
+    // appended as orphans here.
+    for (const arr of autosByTarget.values()) ordered.push(...arr);
+    ordered.push(...autoOrphans);
+    orderedByFamily.set(family, ordered);
   }
 
   // Build the track-layout sequence.
@@ -358,7 +450,7 @@ export function planReorganize(
   const laneToTrackIndex = new Map<string, number>();
   let cursor = 0;
   for (const family of FAMILY_ORDER) {
-    const familyLanes = byFamily.get(family);
+    const familyLanes = orderedByFamily.get(family);
     if (!familyLanes || familyLanes.length === 0) continue;
     if (addSeparators) {
       const fam = FAMILY_LABELS[family];
@@ -375,11 +467,15 @@ export function planReorganize(
       const existing = arr?.tracks[cursor];
       const keepName =
         preserveNames && existing?.name && !isDefaultTrackName(existing.name);
+      // grouped=true ONLY for automation lanes that have a known
+      // target in this same family — those nest visually under the
+      // ungrouped target track above. All other rows stay parents.
+      const grouped = !!(lane.isAutomation && lane.automationTargetIid !== undefined);
       trackMutations.push({
         trackIndex: cursor,
         name: keepName ? undefined : lane.displayName,
         rgb: lane.group.rgb,
-        grouped: false,
+        grouped,
         namePreserved: !!keepName,
       });
       laneToTrackIndex.set(`${lane.kind}:${lane.refId}`, cursor);
