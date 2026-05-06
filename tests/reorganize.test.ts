@@ -78,9 +78,10 @@ describe("classifyByPitchRange — MIDI pitch fallback", () => {
     expect(classifyByPitchRange([note(44)])?.key).toBe("bass");
   });
 
-  test("avg 48..72 → lead; >= 72 → pad", () => {
+  test("avg >= 48 → lead (any melodic range; pad is name-keyword only)", () => {
     expect(classifyByPitchRange([note(60), note(67)])?.key).toBe("lead");
-    expect(classifyByPitchRange([note(72), note(80)])?.key).toBe("pad");
+    expect(classifyByPitchRange([note(72), note(80)])?.key).toBe("lead");
+    expect(classifyByPitchRange([note(93), note(95)])?.key).toBe("lead"); // A6+ — was wrongly "pad"
   });
 
   test("empty → null", () => {

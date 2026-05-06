@@ -182,13 +182,18 @@ export function classifyChannel(
 
 /**
  * Fallback: bucket by the average MIDI key of notes targeting this lane.
+ *
+ * Note: "pad" isn't really pitch-determined (pads are typically
+ * sustained chords, not necessarily high notes), so we only use the
+ * pitch bucket for bass-vs-melodic discrimination. Anything ≥ 48
+ * defaults to "lead" — name-keyword matches still upgrade to "pad"
+ * for explicitly-named pad/atmos/string content.
  */
 export function classifyByPitchRange(notes: readonly Note[]): Group | null {
   if (notes.length === 0) return null;
   const avg = notes.reduce((acc, n) => acc + n.key, 0) / notes.length;
   if (avg < 48) return GROUPS["bass"]!;
-  if (avg < 72) return GROUPS["lead"]!;
-  return GROUPS["pad"]!;
+  return GROUPS["lead"]!;
 }
 
 // --------------------------------------------------------------------------- //
