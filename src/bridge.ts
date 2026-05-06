@@ -248,7 +248,6 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "path",
     "arrangement",
     "add_family_separators",
-    "preserve_existing_track_names",
     "dry_run",
   ]),
 };
@@ -524,7 +523,6 @@ function executeWrite(
       // mixer inserts, or patterns — those carry intentional engineering.
       const arrId = Number(args["arrangement"] ?? 0);
       const addSep = args["add_family_separators"];
-      const preserveTrackNames = args["preserve_existing_track_names"];
       const dryRun = args["dry_run"];
       if (!Number.isFinite(arrId) || arrId < 0) {
         throw new MutationError(
@@ -538,12 +536,6 @@ function executeWrite(
           "args.add_family_separators must be boolean when provided",
         );
       }
-      if (preserveTrackNames !== undefined && typeof preserveTrackNames !== "boolean") {
-        throw new MutationError(
-          "INVALID_ARGS",
-          "args.preserve_existing_track_names must be boolean when provided",
-        );
-      }
       if (dryRun !== undefined && typeof dryRun !== "boolean") {
         throw new MutationError("INVALID_ARGS", "args.dry_run must be boolean when provided");
       }
@@ -551,7 +543,6 @@ function executeWrite(
       const opts = {
         arrangementId: arrId,
         addFamilySeparators: addSep as boolean | undefined,
-        preserveExistingTrackNames: preserveTrackNames as boolean | undefined,
       };
 
       if (dryRun === true) {

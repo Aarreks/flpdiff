@@ -268,6 +268,78 @@ Reorganize v3 (next phase):
 - Multiple linked targets per automation (haven't seen >1 `0xE3`
   per source_iid in the corpus)
 
+## `0xEE` TrackData — `grouped` flag at byte 47 + FL UI parent-inference
+
+Track-data blob (per arrangement track, 70 bytes on FL 25). Layout
+copied from PyFLP's `TrackEvent.STRUCT`:
+
+```
+offset  size  field            notes
+0-3     u32   iid              FL-assigned track id
+4-7     u32   color            0xAARRGGBB; high byte usually 0
+8-11    u32   icon             icon id
+12      u8    enabled          mute toggle
+13-16   f32   height           1.0 = "100%"
+17-20   i32   locked_height
+21      u8    content_locked
+22-25   u32   motion           enum
+26-29   u32   press            enum
+30-33   u32   trigger_sync     enum
+34-37   u32   queued           4-byte bool
+38-41   u32   tolerant         4-byte bool
+42-45   u32   position_sync    enum
+46      u8    ?                 PyFLP doesn't name this byte
+47      u8    grouped          "grouped with track above" Boolean
+48      u8    locked
+49+     ?     trailing          undocumented
+```
+
+### FL UI parent-inference rule
+
+FL implements playlist-track grouping **positionally**: track N is a
+child of the *nearest track at index <N* with `grouped == false`. So
+the grouping is implied by sequence order — no separate "parent
+pointer" is stored. Walking up:
+
+```
+idx=0  Drums    grouped=false   ← parent
+idx=1  Kick     grouped=true    ← child of Drums
+idx=2  Snare    grouped=true    ← child of Drums
+idx=3  Bass     grouped=false   ← new parent
+idx=4  Sub      grouped=true    ← child of Bass
+```
+
+A track at index 0 is always a parent regardless of its flag.
+
+### Implication for `reorganize_project` v3
+
+To nest an automation track under its target instrument:
+
+1. Place the auto track *immediately after* the target's playlist
+   row (positional adjacency is the only way FL recognises the
+   parent).
+2. Set `grouped = true` (byte 47) on the auto track via
+   `setTrackGrouped`.
+3. The target above MUST have `grouped == false` — if a chain of
+   already-grouped tracks separates it from the auto, FL walks
+   further up and resolves to the wrong parent.
+
+### Round-trip caveat
+
+`grouped` is preserved bit-exact through `parse → serialize → parse`
+(verified on the v3 reorganize output). FL UI's *visual* rendering
+of nesting (subtle indent + a fold-arrow on the parent) requires the
+parent to be in the expanded state — controlled by FL at runtime, not
+encoded in the file as far as we've observed. So a freshly-saved FLP
+from our reorganize lands the children in expanded view by default.
+
+If FL doesn't appear to render the indent visually after a fresh
+load, click the parent track's name once — FL will show the children
+as collapsible. None of the local-corpus FLPs surveyed (85 producer
+projects) used playlist-track grouping, so we have no reference for
+"how it should look user-saved" beyond what FL renders on our
+generated output.
+
 ## Changelog
 
 - **2026-04-16** — Initial version. Tempo at bytes 155-158 as

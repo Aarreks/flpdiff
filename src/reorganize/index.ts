@@ -229,8 +229,6 @@ export type TrackMutation = {
   grouped?: boolean;
   /** True for empty `[Family]` separator rows (no clip moves into them). */
   isFamilySeparator?: boolean;
-  /** True when name was already-semantic and `preserveExistingTrackNames` skipped renaming. */
-  namePreserved?: boolean;
 };
 
 export type ClipMoveMutation = {
@@ -253,16 +251,7 @@ export type ReorganizeOptions = {
   arrangementId?: number;
   /** Insert empty `[Family]` separator tracks between family blocks. Default true. */
   addFamilySeparators?: boolean;
-  /** Skip renaming tracks that already have a non-default name. Default true. */
-  preserveExistingTrackNames?: boolean;
 };
-
-const DEFAULT_TRACK_NAME_RE = /^(Track|Audio Track)\s*\d*$/i;
-
-function isDefaultTrackName(name: string | undefined): boolean {
-  if (!name) return true;
-  return DEFAULT_TRACK_NAME_RE.test(name.trim());
-}
 
 function notesByChannelIid(project: FLPProject): Map<number, Note[]> {
   const out = new Map<number, Note[]>();
@@ -385,7 +374,6 @@ export function planReorganize(
 ): ReorganizePlan {
   const arrangementId = options.arrangementId ?? 0;
   const addSeparators = options.addFamilySeparators ?? true;
-  const preserveNames = options.preserveExistingTrackNames ?? true;
 
   const arr = project.arrangements.find((a) => a.id === arrangementId);
   const lanes = collectLanes(project, arrangementId);
@@ -464,19 +452,19 @@ export function planReorganize(
       cursor += 1;
     }
     for (const lane of familyLanes) {
-      const existing = arr?.tracks[cursor];
-      const keepName =
-        preserveNames && existing?.name && !isDefaultTrackName(existing.name);
+      // Always rename target tracks: the lane is reassigned to this
+      // track index, so any pre-existing user name no longer reflects
+      // the content we're moving in. (Tracks BEYOND `cursor` stay
+      // untouched since the loop never reaches them.)
       // grouped=true ONLY for automation lanes that have a known
       // target in this same family — those nest visually under the
       // ungrouped target track above. All other rows stay parents.
       const grouped = !!(lane.isAutomation && lane.automationTargetIid !== undefined);
       trackMutations.push({
         trackIndex: cursor,
-        name: keepName ? undefined : lane.displayName,
+        name: lane.displayName,
         rgb: lane.group.rgb,
         grouped,
-        namePreserved: !!keepName,
       });
       laneToTrackIndex.set(`${lane.kind}:${lane.refId}`, cursor);
       cursor += 1;
