@@ -178,6 +178,7 @@ ts/
 ├── docs/
 │   ├── parser-architecture.md   # typed-binary + custom-schemas + error infra
 │   ├── flp-info-shape.md        # Pass-2 contract + full closure log
+│   ├── mutations-gotchas.md     # bulk-match moveClip, int8 routing, JS numeric-key trap, …
 │   └── fl-format/               # FL binary format knowledge (symlinked from python/docs/)
 │       ├── flp-format-spec.md   # clean-room FLP format spec (living catalog)
 │       └── fl25-event-format.md
