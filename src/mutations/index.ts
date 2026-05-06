@@ -1032,11 +1032,11 @@ export function setTrackColor(
 }
 
 // --------------------------------------------------------------------------- //
-// setTrackGrouped — toggle "grouped with track above" flag (byte 47)
+// setTrackGrouped — toggle "grouped with track above" flag (byte 46)
 // --------------------------------------------------------------------------- //
 
 /**
- * Toggle the `grouped` flag at byte 47 of the 70-byte `0xEE`
+ * Toggle the `grouped` flag at byte 46 of the 70-byte `0xEE`
  * track-data blob. FL infers parent/child track grouping positionally:
  * track N is a CHILD of the nearest track at index <N with
  * `grouped == false`. So setting `grouped: true` on track 5 makes it
@@ -1109,14 +1109,17 @@ export function setTrackGrouped(
     );
   }
   const orig = events[trackBlobIdx]!;
-  if (orig.kind !== "blob" || orig.payload.byteLength < 48) {
+  if (orig.kind !== "blob" || orig.payload.byteLength < 47) {
     throw new MutationError(
       "INVALID_ARGS",
-      `track-data blob too small for grouped flag (${orig.kind === "blob" ? orig.payload.byteLength : 0} bytes; need >= 48)`,
+      `track-data blob too small for grouped flag (${orig.kind === "blob" ? orig.payload.byteLength : 0} bytes; need >= 47)`,
     );
   }
   const newPayload = new Uint8Array(orig.payload);
-  newPayload[47] = grouped ? 1 : 0;
+  // Byte 46 = grouped (per PyFLP TrackEvent struct, end-offset 47);
+  // byte 47 is `locked`. We had these off-by-one until 2026-05-07
+  // when FL UI showed "Lock to content" enabled instead of grouping.
+  newPayload[46] = grouped ? 1 : 0;
   events[trackBlobIdx] = { kind: "blob", opcode: OP_TRACK_DATA, payload: newPayload };
   return { ...project, events };
 }

@@ -156,10 +156,16 @@ export function decodeTrackData(payload: Uint8Array, index: number): Track {
   if (payload.byteLength >= 12) track.icon = view.getUint32(8, true);
   if (payload.byteLength >= 13) track.enabled = view.getUint8(12) !== 0;
   if (payload.byteLength >= 17) track.height = view.getFloat32(13, true);
-  // Per PyFLP TrackEvent struct: byte 47 = grouped (1-byte bool),
-  // byte 48 = locked. Earlier FL builds may stop short of byte 47.
-  if (payload.byteLength >= 48) track.grouped = view.getUint8(47) !== 0;
-  if (payload.byteLength >= 49) track.locked = view.getUint8(48) !== 0;
+  // Per PyFLP TrackEvent.STRUCT cumulative offsets:
+  //   position_sync Int32ul → bytes 42-45 (ends at 46)
+  //   grouped       Flag    → byte 46     (ends at 47)
+  //   locked        Flag    → byte 47     (ends at 48)
+  // We previously had these off-by-one (read byte 47 as grouped),
+  // which silently set FL's "Lock to content" instead of "Group with
+  // above track" on every reorganized auto track. Caught when Roman
+  // observed the wrong checkbox state in FL's track menu (2026-05-07).
+  if (payload.byteLength >= 47) track.grouped = view.getUint8(46) !== 0;
+  if (payload.byteLength >= 48) track.locked = view.getUint8(47) !== 0;
   return track;
 }
 

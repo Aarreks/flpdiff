@@ -152,7 +152,7 @@ describe("decodeClips — binary-format unit tests (crafted payloads)", () => {
 // track hierarchy that was previously invisible to the parser.
 // --------------------------------------------------------------------------- //
 
-describe("decodeTrackData — grouped flag (byte 47)", () => {
+describe("decodeTrackData — grouped flag (byte 46)", () => {
   function makeTrackBlob(opts: {
     iid?: number;
     color?: number;
@@ -165,12 +165,12 @@ describe("decodeTrackData — grouped flag (byte 47)", () => {
     const view = new DataView(buf.buffer);
     if (opts.iid !== undefined) view.setUint32(0, opts.iid, true);
     if (opts.color !== undefined) view.setUint32(4, opts.color, true);
-    if (opts.grouped !== undefined) view.setUint8(47, opts.grouped ? 1 : 0);
-    if (opts.locked !== undefined) view.setUint8(48, opts.locked ? 1 : 0);
+    if (opts.grouped !== undefined) view.setUint8(46, opts.grouped ? 1 : 0);
+    if (opts.locked !== undefined) view.setUint8(47, opts.locked ? 1 : 0);
     return buf;
   }
 
-  test("byte 47 = 0 → grouped: false", () => {
+  test("byte 46 = 0 → grouped: false", () => {
     const blob = makeTrackBlob({ iid: 42, grouped: false });
     const t = decodeTrackData(blob, 5);
     expect(t.index).toBe(5);
@@ -178,20 +178,20 @@ describe("decodeTrackData — grouped flag (byte 47)", () => {
     expect(t.grouped).toBe(false);
   });
 
-  test("byte 47 = 1 → grouped: true", () => {
+  test("byte 46 = 1 → grouped: true", () => {
     const blob = makeTrackBlob({ iid: 7, grouped: true });
     const t = decodeTrackData(blob, 9);
     expect(t.grouped).toBe(true);
   });
 
-  test("grouped is independent of locked (byte 47 vs 48)", () => {
+  test("grouped is independent of locked (byte 46 vs 47)", () => {
     expect(decodeTrackData(makeTrackBlob({ grouped: true, locked: false }), 0).grouped).toBe(true);
     expect(decodeTrackData(makeTrackBlob({ grouped: true, locked: false }), 0).locked).toBe(false);
     expect(decodeTrackData(makeTrackBlob({ grouped: false, locked: true }), 0).grouped).toBe(false);
     expect(decodeTrackData(makeTrackBlob({ grouped: false, locked: true }), 0).locked).toBe(true);
   });
 
-  test("payload shorter than 48 bytes → grouped undefined (don't read past end)", () => {
+  test("payload shorter than 47 bytes → grouped undefined (don't read past end)", () => {
     const short = new Uint8Array(40);
     const t = decodeTrackData(short, 0);
     expect(t.grouped).toBeUndefined();
@@ -226,7 +226,7 @@ describe("setTrackGrouped — round-trip preserves all other track-data bytes", 
     expect(re.arrangements[0]?.tracks[4]?.grouped === true).toBe(false);
   });
 
-  test("setTrackGrouped only touches byte 47 of the target track's blob", async () => {
+  test("setTrackGrouped only touches byte 46 of the target track's blob", async () => {
     const project = await loadProject();
     const TRACK_IDX = 5;
     const before = project.arrangements[0]!.tracks[TRACK_IDX]!;
