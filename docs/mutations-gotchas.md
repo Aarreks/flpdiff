@@ -207,7 +207,37 @@ track" — caught in live-FL verify on 2026-05-07.
 
 (Decision D-45.)
 
-## 9. Prefer rule-based logic over LLM for invariant-checkable tasks
+## 9. Live-FL acceptance verify is fragile on cross-machine FLPs
+
+Real producer FLPs almost always reference plugins or samples not
+installed on the verifier machine. Two failure modes that block FL
+even before our automation can run a menu click:
+
+1. **Missing-plugins / missing-samples modal** — FL's standard
+   "Problems loading the project" dialog. Dismissable with
+   `keystroke return` once or twice.
+2. **PACE License Support fatal-error dialog** — third-party plugins
+   (e.g. Soundtoys DevilLoc Deluxe in `pp6_refl.flp`) trigger a
+   licensing-failure popup that comes from PACE, not FL. FL then
+   freezes — `osascript` querying FL's menu bar starts returning
+   `Can't get menu bar 1 of process "OsxFL". Invalid index.` because
+   FL's accessibility tree has collapsed. Pressing OK on the dialog
+   doesn't always unfreeze FL.
+
+**Implication:** for stress / scale testing, prefer byte-level
+verification — re-parse the post-reorganize FLP via
+`parseFLPFile` and assert on `Channel`/`Track`/`Clip` state. Live-FL
+is the bonus visual check; reserve it for small clean fixtures
+without external plugin dependencies. The
+`mcp/scripts/reorganize_stress.py` harness uses byte-level + the
+existing harness invariants, which is what passes 85/85 on the
+local corpus. The `mcp/scripts/fl_verify_reorganize.py` is for
+visual confirmation on a single fixture you've curated for
+reachable plugins/samples.
+
+(Decision D-49.)
+
+## 10. Prefer rule-based logic over LLM for invariant-checkable tasks
 
 If a task's success criteria can be expressed as a programmatic
 invariant set (palette colors, naming conventions, routing
