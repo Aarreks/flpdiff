@@ -251,3 +251,55 @@ LLM-shaped tasks for genuinely creative work (compose a melody,
 suggest a chord progression) — **not** classification + lookup.
 
 (Decision D-35.)
+
+## 11. Pattern-scoped opcodes need a scope-walker, not a global rewrite
+
+Pattern notes (`0xE0`) and pattern controllers (`0xDF`) live inside
+the slice `[0x41 patternId, ..., next 0x41 or 0x63]` — they are NOT
+top-level. A naïve "drop every `0xE0` in the events array" is wrong:
+it nukes notes from sibling patterns too.
+
+Use `findPatternScope(events, patternId)` to bound the rewrite:
+
+```ts
+const scope = findPatternScope(events, patternId);  // {startIdx, endIdx}
+const newEvents = events.filter((ev, i) => {
+  if (i > scope.startIdx && i < scope.endIdx && ev.opcode === OP_PATTERN_NOTES) {
+    return false; // drop only inside target scope
+  }
+  return true;
+});
+```
+
+The scope spans from the matching `0x41` marker through the byte
+before the next `0x41` (next pattern) or `0x63` (start of arrangement
+section). `setPatternNotes` and `setPatternControllers` both follow
+this pattern.
+
+Re-find the scope after any drop pass — the indices shift when events
+are removed. (See `setPatternNotes` and `setPatternControllers` in
+`src/mutations/index.ts` for the canonical shape.)
+
+Insertion position matters too: place the new (single, coalesced)
+event right after the pattern's `0xC1` name event, or after the
+`0x41` marker if there's no name. FL emits its own events in this
+order on freshly-saved files.
+
+(Decisions D-50/F2.1, D-50/F2.2.)
+
+## 12. Multiple `0xE0` / `0xDF` events per pattern are concatenated, not the latest-wins
+
+FL emits a single `0xE0` per pattern on save, but the parser
+accepts and concatenates multiple — `[0xE0 a, 0xE0 b]` reads as
+`a + b` notes. The encoder helpers exploit this: when adding one
+note via `addPatternNote`, we COULD just append a tiny new `0xE0`
+event with one record (24 bytes) and FL would still see all the
+notes. We chose to coalesce instead — drop existing + emit one
+combined blob — because:
+
+1. Re-saved files match FL's typical save shape (one event per opcode)
+2. Future tooling that diffs `0xE0` payloads byte-by-byte sees a
+   minimal diff vs scattered new events
+
+Either approach round-trips. The coalesce strategy makes byte-diff
+tooling honest about what changed.

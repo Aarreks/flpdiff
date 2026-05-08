@@ -348,6 +348,74 @@ projects) used playlist-track grouping, so we have no reference for
 "how it should look user-saved" beyond what FL renders on our
 generated output.
 
+## `0xE0` Pattern notes + `0xDF` Pattern controllers — encoder-side reference
+
+Both opcodes are pattern-scoped (live between `0x41 patternId` markers
+in the event stream) and both carry a dense array of fixed-size
+records. Multiple events of the same opcode within a pattern get
+concatenated on read — FL reads `[0xE0 a, 0xE0 b]` as if it were one
+`0xE0 a+b` blob. flpdiff's encoders coalesce to a single event per
+opcode when rewriting; FL accepts both shapes.
+
+### `0xE0` notes — 24 bytes per record
+
+Cross-checked against PyFLP `NotesEvent.STRUCT` (cumulative-end
+offsets corrected per D-45):
+
+| Bytes | Field | Type | Notes |
+|------:|-------|------|-------|
+| 0..3 | `position` | u32 LE | tick offset within the pattern (PPQ) |
+| 4..5 | `flags` | u16 LE | bit `0x08` = slide note; other bits unassigned |
+| 6..7 | `channel_iid` | u16 LE | targets `Channel.iid` |
+| 8..11 | `length` | u32 LE | length in PPQ ticks |
+| 12..13 | `key` | u16 LE | FL MIDI range `[0, 131]` (60 = C5) |
+| 14..15 | `group` | u16 LE | chord/slide group id (0 = ungrouped) |
+| 16 | `fine_pitch` | u8 | 0..240 (120 = no shift) |
+| 17 | reserved (PyFLP `_u1`) | u8 | encoder writes 0 |
+| 18 | `release` | u8 | 0..128 (64 = neutral) |
+| 19 | `midi_channel` | u8 | MIDI channel override |
+| 20 | `pan` | u8 | 0..128 (64 = center) |
+| 21 | `velocity` | u8 | 0..127 |
+| 22 | `mod_x` | u8 | 0..255 |
+| 23 | `mod_y` | u8 | 0..255 |
+
+Encoder: `flpdiff/src/mutations/index.ts::encodeNote`. Round-trip
+verified through FL: `addPatternNote` → `parseFLPFile` → FL load → FL
+File→Save → re-parse preserves every field byte-exact (D-50 / F2.1.5;
+only 5 bytes of FL save-counter metadata change anywhere in the file).
+
+### `0xDF` controllers — 12 bytes per record
+
+| Bytes | Field | Type | Notes |
+|------:|-------|------|-------|
+| 0..3 | `position` | u32 LE | tick offset within pattern |
+| 4..5 | reserved (PyFLP `_u1` + `_u2`) | 2 × u8 | encoder writes 0 |
+| 6 | `channel` | u8 | targets the channel by iid (truncated to u8) |
+| 7 | `flags` | u8 | semantics not fully RE'd; encoder preserves what's set |
+| 8..11 | `value` | float32 LE | normalized parameter value |
+
+Encoder: `flpdiff/src/mutations/index.ts::encodeController`. Per-pattern
+keyframe-automation points; FL's "event editor" on a piano roll renders
+them as a step/curve over the pattern. Round-trip verified at the
+parser level (re-serialize → re-parse preserves all 5 in our 5-point
+ramp fixture; non-`0xDF` event stream byte-identical to baseline);
+live-FL save round-trip pending Roman's next FL session (F2.2.3).
+
+### Pattern-scope walker
+
+Both encoders use a `findPatternScope` helper that returns
+`{startIdx, endIdx}` for the slice from the `0x41` opcode that opens
+the pattern through the byte before the next pattern boundary
+(`0x41` or `0x63 ARRANGEMENT_NEW`, whichever comes first). When
+rewriting `0xE0` / `0xDF`, the walker:
+
+1. Drops every existing event of the target opcode within the scope
+2. Inserts the new (single, coalesced) event right after the `0xC1`
+   pattern-name event (or right after the `0x41` marker if the
+   pattern has no name).
+
+Mirrors FL's typical event order on freshly-saved files.
+
 ## Changelog
 
 - **2026-04-16** — Initial version. Tempo at bytes 155-158 as
