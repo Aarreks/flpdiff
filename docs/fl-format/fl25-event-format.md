@@ -416,6 +416,79 @@ rewriting `0xE0` / `0xDF`, the walker:
 
 Mirrors FL's typical event order on freshly-saved files.
 
+## Section ordering — channels, patterns, mixer, arrangement
+
+Empirical observation across the FL 25 corpus (5 synthetic fixtures +
+85 real producer projects):
+
+```
+[FLhd 14 bytes][FLdt header 8 bytes]
+  ├ project metadata (tempo, time-sig, version banner, etc.)
+  ├ channel + pattern openers — INTERLEAVED (0x40 and 0x41
+  │   appear in mixed order), each carrying their full scope-event
+  │   train until the next opener of either type
+  ├ 0x63 ARRANGEMENT_NEW — opens the arrangement section
+  │   (track-data 0xEE, track-name 0xEF, playlist 0xE9, time markers …)
+  ├ 0xEC INSERT_FLAGS / 0x93 INSERT_END — opens the mixer section
+  │   (per-insert 0x62 NEW_SLOT scopes, mixer params 0xE1, routing 0xE7)
+  └ 0x33, 0xAA, …  trailing project state
+```
+
+Implication for encoders: a NEW channel or pattern slots in just
+before the first `0x63` (after the channel/pattern interleave block,
+before arrangements). FL accepts this placement and re-emits in the
+same shape on save. See `findInsertionBeforeArrangements` in
+`flpdiff/src/mutations/index.ts`.
+
+## `0x40` Channel + `0x41` Pattern minimum-viable scopes (encoder side)
+
+Both opcodes open a new scope (channel or pattern) with a u16 id; the
+follow-up events inside that scope are what FL reads as the channel /
+pattern's content. Most opcodes have FL-supplied defaults — encoders
+need to emit only the bare minimum.
+
+### Minimum new pattern (`createPattern`)
+
+```
+0x41  u16  newId           // OP_PATTERN_NEW: id = max(existing) + 1
+0xC1  blob name (UTF-16LE) // OP_PATTERN_NAME, optional but recommended
+```
+
+That's it. FL renders length / color / looped / notes / controllers
+from defaults on first read and re-emits explicit events on the next
+save once the user touches them. `0xA4` length defaults to "use
+project bar"; `0x96` color falls back to the palette default; `0x1A`
+looped defaults to false.
+
+### Minimum new channel (`createChannel`)
+
+```
+0x40  u16   newIid         // OP_NEW_CHANNEL: iid = max(existing) + 1
+0x15  u8    kindByte       // OP_CHANNEL_TYPE: 0=sampler, 2=instrument,
+                           //                  3=layer, 5=automation
+0xCB  blob  name           // OP_NAME (channel scope)
+[0xC9 blob  ""]            // optional: empty OP_PLUGIN_INTERNAL_NAME
+                           //   for instrument kind, signals "placeholder
+                           //   for a future plugin" to FL
+```
+
+The `0x15` byte is what FL uses to classify the channel — without it
+the channel reads as `kind="unknown"` and FL renders an empty slot.
+Sampler channels need only the byte; instrument channels also need
+the `0xC9` slot present (even if empty) so FL knows to expect a
+plugin DLL hookup. Other supporting opcodes (`0x80` color, `0x16`
+routing, `0xCB` levels, `0xD7` plugin-state blob, …) all default
+sensibly when absent — the first FL save round-trip emits them.
+
+### `header.n_channels` is legacy
+
+The `FLhd` header's u16 `n_channels` field is documented as legacy
+(`flpdiff/src/parser/flp-project.ts:14-18`) — modern FL always writes
+`0` and derives the real count from the event stream. `createChannel`
+intentionally does NOT bump this field; the new `0x40` event alone is
+sufficient for FL to surface the new channel in the rack. (Decision
+D-53.)
+
 ## Changelog
 
 - **2026-04-16** — Initial version. Tempo at bytes 155-158 as
