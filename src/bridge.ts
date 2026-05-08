@@ -67,6 +67,9 @@ import {
   createPattern,
   createChannel,
   type ChannelKindInput,
+  setNativePluginParam,
+  type PluginParamRef,
+  type PluginScope,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -134,6 +137,7 @@ const WRITE_KINDS = new Set([
   "remove_pattern_controller",
   "create_pattern",
   "create_channel",
+  "set_native_plugin_param",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -374,6 +378,17 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   remove_pattern_controller: new Set(["path", "pattern_id", "index"]),
   create_pattern: new Set(["path", "name"]),
   create_channel: new Set(["path", "name", "kind"]),
+  set_native_plugin_param: new Set([
+    "path",
+    "scope",
+    "channel_iid",
+    "insert_index",
+    "slot_index",
+    "param",
+    "band",
+    "field",
+    "value",
+  ]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -813,6 +828,71 @@ function executeWrite(
           pattern_id: result.id,
         },
       };
+    } else if (kind === "set_native_plugin_param") {
+      const scopeKind = args["scope"];
+      let scope: PluginScope;
+      if (scopeKind === "channel") {
+        const cid = Number(args["channel_iid"]);
+        if (!Number.isFinite(cid)) {
+          throw new MutationError(
+            "INVALID_ARGS",
+            "args.channel_iid required when scope='channel'",
+          );
+        }
+        scope = { kind: "channel", channelIid: cid };
+      } else if (scopeKind === "mixer_slot") {
+        const ii = Number(args["insert_index"]);
+        const si = Number(args["slot_index"]);
+        if (!Number.isFinite(ii) || !Number.isFinite(si)) {
+          throw new MutationError(
+            "INVALID_ARGS",
+            "args.insert_index + args.slot_index required when scope='mixer_slot'",
+          );
+        }
+        scope = { kind: "mixer_slot", insertIndex: ii, slotIndex: si };
+      } else {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.scope must be 'channel' or 'mixer_slot'",
+        );
+      }
+
+      // param = "main_level" or band field; band fields use args.band + args.field
+      let param: PluginParamRef;
+      const paramKind = args["param"];
+      if (paramKind === "main_level") {
+        param = { kind: "main_level" };
+      } else if (paramKind === "band") {
+        const band = Number(args["band"]);
+        const field = args["field"];
+        if (!Number.isFinite(band)) {
+          throw new MutationError(
+            "INVALID_ARGS",
+            "args.band required (1..7) when param='band'",
+          );
+        }
+        if (field !== "level" && field !== "freq" && field !== "width") {
+          throw new MutationError(
+            "INVALID_ARGS",
+            "args.field must be 'level' | 'freq' | 'width' when param='band'",
+          );
+        }
+        param = { kind: "band", band, field };
+      } else {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.param must be 'main_level' or 'band'",
+        );
+      }
+
+      const value = Number(args["value"]);
+      if (!Number.isFinite(value)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.value required (normalized 0..1)",
+        );
+      }
+      mutated = setNativePluginParam(project, scope, param, value);
     } else if (kind === "create_channel") {
       const name = args["name"];
       const kindArg = args["kind"];

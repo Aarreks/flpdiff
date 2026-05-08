@@ -2054,3 +2054,292 @@ export function createChannel(
   events.splice(insertAt, 0, ...newEvents);
   return { project: { ...project, events }, iid: newIid };
 }
+
+// --------------------------------------------------------------------------- //
+// F2.4 — Native plugin parameters (Fruity Parametric EQ 2 prototype)           //
+// --------------------------------------------------------------------------- //
+
+const OP_PLUGIN_STATE = 0xd5;
+const OP_NEW_SLOT = 0x62;
+const OP_PLUGIN_NAME_IN_MIXER_SCOPE = OP_NAME; // 0xCB - in mixer-slot scope, this is the plugin name
+
+/**
+ * Field within a Fruity Parametric EQ 2 band that can be mutated.
+ * `level` / `freq` / `width` are uint16-scaled (`round(v * 0xFFFF)`);
+ * `type` / `order` are uint8 enums (deferred — pass an integer 0..7
+ * via the `enum_value` variant of `ParamRef` once added).
+ */
+export type EQ2BandField = "level" | "freq" | "width";
+
+export type PluginParamRef =
+  | { kind: "main_level" }
+  | { kind: "band"; band: number; field: EQ2BandField };
+
+export type PluginScope =
+  | { kind: "channel"; channelIid: number }
+  | { kind: "mixer_slot"; insertIndex: number; slotIndex: number };
+
+/**
+ * Per-plugin byte-offset map. `paramRefToOffset` returns
+ * `{offset, fieldType}` where `fieldType` controls how the
+ * normalized 0..1 value gets scaled to bytes.
+ */
+type PluginLayout = {
+  /** Minimum payload size that includes every parameter offset.
+   *  Trailing state past this point is opaque and may vary across FL
+   *  versions — accept any payload >= this. */
+  minSize: number;
+  /** Maximum tolerated size — keeps the check from blessing arbitrary
+   *  unrelated blobs as the same plugin. */
+  maxSize: number;
+  paramRefToOffset: (
+    ref: PluginParamRef,
+  ) => { offset: number; fieldType: "u16" } | null;
+};
+
+const EQ2_LAYOUT: PluginLayout = {
+  // Last param byte is at offset 0x91 (main level high byte). Anything
+  // smaller is missing parameter slots; refuse. FL 25.2.4 emits 354;
+  // older FL saves emit 350 (4 fewer bytes of trailing state). 500 is
+  // a generous upper bound that still rejects unrelated blobs.
+  minSize: 0x92,
+  maxSize: 500,
+  paramRefToOffset: (ref) => {
+    if (ref.kind === "main_level") return { offset: 0x90, fieldType: "u16" };
+    if (ref.kind === "band") {
+      if (!Number.isInteger(ref.band) || ref.band < 1 || ref.band > 7) return null;
+      const slot = (ref.band - 1) * 4;
+      if (ref.field === "level") return { offset: 0x04 + slot, fieldType: "u16" };
+      if (ref.field === "freq") return { offset: 0x20 + slot, fieldType: "u16" };
+      if (ref.field === "width") return { offset: 0x3c + slot, fieldType: "u16" };
+    }
+    return null;
+  },
+};
+
+/**
+ * Registry of native FL plugins whose parameter layout has been
+ * reverse-engineered well enough to support direct byte-patching.
+ *
+ * Keys are the exact plugin-name strings FL emits via the `0xCB`
+ * (mixer slot scope) or via `0xC9` plugin-internal-name. FL 25.2.4
+ * inconsistently uses lowercase `parametric` — we register both.
+ */
+const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
+  "Fruity Parametric EQ 2": EQ2_LAYOUT,
+  "Fruity parametric EQ 2": EQ2_LAYOUT,
+};
+
+/**
+ * Find the index of the `0xD5` (plugin state) event for a given
+ * `PluginScope`, plus the plugin name observed at that scope. Returns
+ * `null` if the scope doesn't resolve or has no plugin state event.
+ */
+function findPluginStateEvent(
+  events: readonly FLPEvent[],
+  scope: PluginScope,
+): { eventIdx: number; pluginName: string | null } | null {
+  if (scope.kind === "channel") {
+    let inScope = false;
+    let scopeIid = -1;
+    let lastName: string | null = null;
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i]!;
+      if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) {
+        inScope = ev.value === scope.channelIid;
+        scopeIid = ev.value;
+        lastName = null;
+        continue;
+      }
+      if (ev.opcode === OP_INSERT_END || ev.opcode === OP_INSERT_FLAGS || ev.opcode === OP_NEW_SLOT) {
+        // Channel section closed.
+        return null;
+      }
+      if (!inScope) continue;
+      if (ev.kind === "blob" && ev.opcode === OP_PLUGIN_INTERNAL_NAME) {
+        lastName = decodeUtf16LeNullTerminated(ev.payload);
+      }
+      if (ev.kind === "blob" && ev.opcode === OP_NAME) {
+        const n = decodeUtf16LeNullTerminated(ev.payload);
+        if (n.length > 0) lastName = n;
+      }
+      if (ev.kind === "blob" && ev.opcode === OP_PLUGIN_STATE) {
+        return { eventIdx: i, pluginName: lastName };
+      }
+    }
+    return null;
+  }
+  // mixer_slot scope.
+  //
+  // Insert numbering: insert 0 is the Master, inserts 1..N are user
+  // inserts. Each insert is closed by an `OP_INSERT_END` (0x93)
+  // event. So events BEFORE the first 0x93 belong to insert 0
+  // (Master), events between 1st and 2nd 0x93 belong to insert 1, etc.
+  // The mixer section opens at the first `OP_INSERT_FLAGS` (0xEC) or
+  // `OP_NEW_SLOT` (0x62).
+  let insertIdx = 0;
+  let curSlotIdx = -1;
+  let inMixer = false;
+  let lastSlotName: string | null = null;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.opcode === OP_INSERT_FLAGS) {
+      inMixer = true;
+      continue;
+    }
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_SLOT) {
+      inMixer = true;
+      curSlotIdx = ev.value;
+      lastSlotName = null;
+      continue;
+    }
+    if (!inMixer) continue;
+    if (ev.opcode === OP_INSERT_END) {
+      // Current insert closes here; next events belong to insertIdx + 1.
+      insertIdx++;
+      curSlotIdx = -1;
+      lastSlotName = null;
+      continue;
+    }
+    if (ev.kind === "blob" && ev.opcode === OP_PLUGIN_NAME_IN_MIXER_SCOPE) {
+      const n = decodeUtf16LeNullTerminated(ev.payload);
+      if (n.length > 0) lastSlotName = n;
+    }
+    if (ev.kind === "blob" && ev.opcode === OP_PLUGIN_INTERNAL_NAME) {
+      const n = decodeUtf16LeNullTerminated(ev.payload);
+      if (n.length > 0 && lastSlotName === null) lastSlotName = n;
+    }
+    if (ev.kind === "blob" && ev.opcode === OP_PLUGIN_STATE) {
+      if (insertIdx === scope.insertIndex && curSlotIdx === scope.slotIndex) {
+        return { eventIdx: i, pluginName: lastSlotName };
+      }
+    }
+  }
+  return null;
+}
+
+function decodeUtf16LeNullTerminated(payload: Uint8Array): string {
+  let end = payload.byteLength;
+  // Strip trailing UTF-16LE NUL pairs.
+  while (end >= 2 && payload[end - 1] === 0 && payload[end - 2] === 0) end -= 2;
+  return new TextDecoder("utf-16le").decode(payload.subarray(0, end));
+}
+
+/**
+ * Patch a single parameter in a native FL plugin's `0xD5` state blob.
+ *
+ * v0.1 supports **only** Fruity Parametric EQ 2 (registered name
+ * variants: `"Fruity Parametric EQ 2"` / `"Fruity parametric EQ 2"`).
+ * Other native plugins have not yet been RE'd; calls against
+ * unsupported plugins reject with `UNSUPPORTED_PLUGIN`.
+ *
+ * Param ref shapes:
+ *   - `{kind: "main_level"}` → byte 0x90 (uint16 LE)
+ *   - `{kind: "band", band: 1..7, field: "level"|"freq"|"width"}` →
+ *     uint16 LE at the band's slot in the corresponding group
+ *
+ * `normalizedValue` is in `[0.0, 1.0]` and stored as
+ * `round(v * 0xFFFF)`. The encoder rejects values outside that range
+ * with `INVALID_ARGS`.
+ *
+ * The `type` and `order` band fields (uint8 enums 0..7) are NOT
+ * supported in v0.1 — they aren't continuous params so a normalized
+ * 0..1 mapping is lossy. Future API may add an enum-value variant.
+ *
+ * VST plugins (Fruity Wrapper-hosted) are NOT supported — their state
+ * blob contains session-internal noise that drifts across same-value
+ * saves, breaking the fixed-offset RE strategy. Use the live MIDI-
+ * script path for VSTs.
+ */
+export function setNativePluginParam(
+  project: FLPProject,
+  scope: PluginScope,
+  param: PluginParamRef,
+  normalizedValue: number,
+): FLPProject {
+  if (!Number.isFinite(normalizedValue) || normalizedValue < 0 || normalizedValue > 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `normalizedValue must be in [0.0, 1.0], got ${normalizedValue}`,
+    );
+  }
+  if (scope.kind === "channel") {
+    if (!Number.isInteger(scope.channelIid) || scope.channelIid < 0) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `scope.channelIid must be a non-negative integer, got ${scope.channelIid}`,
+      );
+    }
+  } else if (scope.kind === "mixer_slot") {
+    if (!Number.isInteger(scope.insertIndex) || scope.insertIndex < 0) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `scope.insertIndex must be a non-negative integer, got ${scope.insertIndex}`,
+      );
+    }
+    if (!Number.isInteger(scope.slotIndex) || scope.slotIndex < 0) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `scope.slotIndex must be a non-negative integer, got ${scope.slotIndex}`,
+      );
+    }
+  } else {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `scope.kind must be 'channel' or 'mixer_slot'`,
+    );
+  }
+
+  const located = findPluginStateEvent(project.events, scope);
+  if (!located) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no plugin state (0xD5) event found at the requested scope`,
+    );
+  }
+  const { eventIdx, pluginName } = located;
+  if (!pluginName) {
+    throw new MutationError(
+      "UNSUPPORTED_PLUGIN",
+      `plugin at the requested scope has no name event; cannot identify layout`,
+    );
+  }
+  const layout = PLUGIN_PARAM_LAYOUTS[pluginName];
+  if (!layout) {
+    const known = Object.keys(PLUGIN_PARAM_LAYOUTS).join(", ");
+    throw new MutationError(
+      "UNSUPPORTED_PLUGIN",
+      `plugin "${pluginName}" has no registered param layout. Known: ${known}`,
+    );
+  }
+  const ev = project.events[eventIdx]!;
+  if (ev.kind !== "blob") {
+    throw new MutationError("EVENT_NOT_FOUND", `0xD5 event is not a blob`);
+  }
+  if (ev.payload.byteLength < layout.minSize || ev.payload.byteLength > layout.maxSize) {
+    throw new MutationError(
+      "UNSUPPORTED_PLUGIN",
+      `plugin "${pluginName}" state blob is ${ev.payload.byteLength} bytes, ` +
+        `expected [${layout.minSize}, ${layout.maxSize}]; layout may be out of date`,
+    );
+  }
+  const offsetInfo = layout.paramRefToOffset(param);
+  if (!offsetInfo) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `param ref ${JSON.stringify(param)} not recognised for plugin "${pluginName}"`,
+    );
+  }
+
+  // Patch a copy.
+  const newPayload = new Uint8Array(ev.payload);
+  if (offsetInfo.fieldType === "u16") {
+    const raw = Math.round(normalizedValue * 0xffff);
+    newPayload[offsetInfo.offset] = raw & 0xff;
+    newPayload[offsetInfo.offset + 1] = (raw >> 8) & 0xff;
+  }
+
+  const events = [...project.events];
+  events[eventIdx] = { kind: "blob", opcode: OP_PLUGIN_STATE, payload: newPayload };
+  return { ...project, events };
+}

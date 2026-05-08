@@ -31,8 +31,11 @@ import {
   encodeController,
   createPattern,
   createChannel,
+  setNativePluginParam,
   MutationError,
 } from "../src/mutations/index.ts";
+import type { FLPProject } from "../src/parser/flp-project.ts";
+import type { FLPEvent } from "../src/parser/event.ts";
 import { buildArrangements } from "../src/parser/project-builder.ts";
 import { buildProjectSummary } from "../src/summary.ts";
 import { buildChannels } from "../src/parser/project-builder.ts";
@@ -1300,5 +1303,225 @@ describe("createChannel", () => {
     const c = reparsed.channels.find((x) => x.iid === iid);
     expect(c?.color).toBeDefined();
     expect(c?.color?.r).toBe(255);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F2.4 — Native plugin params (Fruity Parametric EQ 2 prototype)              //
+// --------------------------------------------------------------------------- //
+
+function utf16leNul(s: string): Uint8Array {
+  const out = new Uint8Array((s.length + 1) * 2);
+  const view = new DataView(out.buffer);
+  for (let i = 0; i < s.length; i++) view.setUint16(i * 2, s.charCodeAt(i), true);
+  return out;
+}
+
+/**
+ * Build a synthetic FLPProject containing two mixer slots with EQ 2:
+ *  - Insert 1, Slot 0: Fruity parametric EQ 2 (354-byte zero blob)
+ *  - Insert 2, Slot 3: Fruity Parametric EQ 2 (354-byte zero blob)
+ * Master (insert 0) is empty.
+ */
+function makeEQ2Project(): FLPProject {
+  const eq2A = new Uint8Array(354);
+  const eq2B = new Uint8Array(354);
+  const events: FLPEvent[] = [
+    { kind: "blob", opcode: 0xec, payload: new Uint8Array(0) }, // INSERT_FLAGS opens mixer
+    { kind: "blob", opcode: 0x93, payload: new Uint8Array(4) }, // master closes (insert 0 → 1)
+    { kind: "u16", opcode: 0x62, value: 0 }, // insert 1, slot 0
+    { kind: "blob", opcode: 0xcb, payload: utf16leNul("Fruity parametric EQ 2") },
+    { kind: "blob", opcode: 0xd5, payload: eq2A },
+    { kind: "blob", opcode: 0x93, payload: new Uint8Array(4) }, // insert 1 closes
+    { kind: "u16", opcode: 0x62, value: 3 }, // insert 2, slot 3
+    { kind: "blob", opcode: 0xcb, payload: utf16leNul("Fruity Parametric EQ 2") },
+    { kind: "blob", opcode: 0xd5, payload: eq2B },
+    { kind: "blob", opcode: 0x93, payload: new Uint8Array(4) }, // insert 2 closes
+  ];
+  return {
+    header: { format: 0, n_channels: 0, ppq: 96 },
+    events,
+    metadata: {} as never,
+    channels: [],
+    inserts: [],
+    patterns: [],
+    arrangements: [],
+    insertRouting: [],
+  };
+}
+
+function readU16LE(buf: Uint8Array, offset: number): number {
+  return buf[offset]! | (buf[offset + 1]! << 8);
+}
+
+describe("setNativePluginParam — Fruity Parametric EQ 2", () => {
+  test("patches band 1 freq at byte 0x20 (uint16 LE = round(v * 0xFFFF))", () => {
+    const project = makeEQ2Project();
+    const mutated = setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "band", band: 1, field: "freq" },
+      0.5,
+    );
+    // Find the EQ2 blob that we mutated.
+    const ev = mutated.events.find(
+      (e, i) => e.opcode === 0xd5 && i === 4,
+    )!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(ev.payload.byteLength).toBe(354);
+    const raw = readU16LE(ev.payload, 0x20);
+    // round(0.5 * 0xFFFF) = 32768 = 0x8000
+    expect(raw).toBe(0x8000);
+  });
+
+  test("patches main level at byte 0x90", () => {
+    const project = makeEQ2Project();
+    const mutated = setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "main_level" },
+      0.75,
+    );
+    const ev = mutated.events[4]!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(readU16LE(ev.payload, 0x90)).toBe(Math.round(0.75 * 0xffff));
+  });
+
+  test("patches band 7 width at byte 0x3c + 6*4 = 0x54", () => {
+    const project = makeEQ2Project();
+    const mutated = setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "band", band: 7, field: "width" },
+      0.3,
+    );
+    const ev = mutated.events[4]!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(readU16LE(ev.payload, 0x54)).toBe(Math.round(0.3 * 0xffff));
+  });
+
+  test("targets the correct slot when multiple EQ 2 instances exist", () => {
+    const project = makeEQ2Project();
+    // Patch insert 2 / slot 3, NOT insert 1 / slot 0.
+    const mutated = setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 2, slotIndex: 3 },
+      { kind: "band", band: 1, field: "freq" },
+      0.5,
+    );
+    // Slot at insert 1 (events[4]) should be UNTOUCHED.
+    const evA = mutated.events[4]!;
+    if (evA.kind !== "blob") throw new Error("expected blob");
+    expect(readU16LE(evA.payload, 0x20)).toBe(0); // baseline zero blob
+
+    // Slot at insert 2 (events[8]) should be patched.
+    const evB = mutated.events[8]!;
+    if (evB.kind !== "blob") throw new Error("expected blob");
+    expect(readU16LE(evB.payload, 0x20)).toBe(0x8000);
+  });
+
+  test("source project not mutated", () => {
+    const project = makeEQ2Project();
+    setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "main_level" },
+      0.5,
+    );
+    const ev = project.events[4]!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(readU16LE(ev.payload, 0x90)).toBe(0);
+  });
+
+  test("rejects normalizedValue outside [0, 1]", () => {
+    const project = makeEQ2Project();
+    const ref = { kind: "main_level" } as const;
+    const scope = { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 } as const;
+    expect(() => setNativePluginParam(project, scope, ref, -0.01)).toThrow(MutationError);
+    expect(() => setNativePluginParam(project, scope, ref, 1.01)).toThrow(MutationError);
+    expect(() => setNativePluginParam(project, scope, ref, NaN)).toThrow(MutationError);
+  });
+
+  test("rejects unknown band number", () => {
+    const project = makeEQ2Project();
+    expect(() =>
+      setNativePluginParam(
+        project,
+        { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+        { kind: "band", band: 0, field: "freq" },
+        0.5,
+      ),
+    ).toThrow(MutationError);
+    expect(() =>
+      setNativePluginParam(
+        project,
+        { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+        { kind: "band", band: 8, field: "freq" },
+        0.5,
+      ),
+    ).toThrow(MutationError);
+  });
+
+  test("EVENT_NOT_FOUND when scope has no plugin state event", () => {
+    const project = makeEQ2Project();
+    expect(() =>
+      setNativePluginParam(
+        project,
+        { kind: "mixer_slot", insertIndex: 99, slotIndex: 0 },
+        { kind: "main_level" },
+        0.5,
+      ),
+    ).toThrow(MutationError);
+  });
+
+  test("UNSUPPORTED_PLUGIN for non-EQ2 plugin", () => {
+    const project = makeEQ2Project();
+    // Replace the plugin name on insert 1 / slot 0 with something unknown.
+    const newEvents = [...project.events];
+    newEvents[3] = { kind: "blob", opcode: 0xcb, payload: utf16leNul("Unknown Plugin Name") };
+    const altered: FLPProject = { ...project, events: newEvents };
+    expect(() =>
+      setNativePluginParam(
+        altered,
+        { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+        { kind: "main_level" },
+        0.5,
+      ),
+    ).toThrow(MutationError);
+  });
+
+  test("UNSUPPORTED_PLUGIN when EQ 2 blob is too small (missing param slots)", () => {
+    const project = makeEQ2Project();
+    // Shrink the EQ2 blob to 100 bytes (below the 0x92 minimum) — reject.
+    const newEvents = [...project.events];
+    newEvents[4] = { kind: "blob", opcode: 0xd5, payload: new Uint8Array(100) };
+    const altered: FLPProject = { ...project, events: newEvents };
+    expect(() =>
+      setNativePluginParam(
+        altered,
+        { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+        { kind: "main_level" },
+        0.5,
+      ),
+    ).toThrow(MutationError);
+  });
+
+  test("accepts older FL save's 350-byte EQ 2 blob (only trailing state differs)", () => {
+    const project = makeEQ2Project();
+    // FL 25.2.4 emits 354 bytes; older FL saves 350. Both have the same
+    // parameter offsets up to 0x91; only the trailing opaque state differs.
+    const newEvents = [...project.events];
+    newEvents[4] = { kind: "blob", opcode: 0xd5, payload: new Uint8Array(350) };
+    const altered: FLPProject = { ...project, events: newEvents };
+    const mutated = setNativePluginParam(
+      altered,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "band", band: 1, field: "freq" },
+      0.5,
+    );
+    const ev = mutated.events[4]!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(ev.payload.byteLength).toBe(350);
+    expect(readU16LE(ev.payload, 0x20)).toBe(0x8000);
   });
 });
