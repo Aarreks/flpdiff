@@ -628,20 +628,27 @@ export function buildChannels(
   }
 
   // Third pass: resolve `kind` now that every channel iid is known.
-  // Small u16 destinations matching an existing channel iid are
-  // direct channel-targeted automations (the case we render as a
-  // nested track). Larger values (>= 0x1000) are mixer-slot
-  // encodings; flpdiff doesn't decode those yet.
+  // Mixer-slot destinations are flagged by bit `0x2000` (RE'd
+  // 2026-05-09 across 57/57 corpus samples — see D-57). Layout:
+  //   bit  13 (0x2000) → mixer-slot marker
+  //   bits 6..12       → mixer insert index (0..127)
+  //   bits 0..5        → slot index (0..63)
+  // Channel-targeted automations have the marker bit clear and
+  // the raw destination matching an existing `Channel.iid`.
   const channelIids = new Set(channels.map((c) => c.iid));
+  const MIXER_SLOT_MARKER = 0x2000;
   for (const ch of channels) {
     const target = ch.automationTarget;
     if (!target) continue;
-    if (target.rawDestination < 0x1000 && channelIids.has(target.rawDestination)) {
+    if ((target.rawDestination & MIXER_SLOT_MARKER) !== 0) {
+      target.kind = "mixer_slot";
+      target.targetInsertIndex = (target.rawDestination >> 6) & 0x7f;
+      target.targetSlotIndex = target.rawDestination & 0x3f;
+    } else if (channelIids.has(target.rawDestination)) {
       target.kind = "channel";
       target.targetChannelIid = target.rawDestination;
-    } else if (target.rawDestination >= 0x1000) {
-      target.kind = "mixer_slot";
     }
+    // else: leave `kind = "unknown"` (no marker bit, no matching iid).
   }
 
   return channels;

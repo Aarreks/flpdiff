@@ -232,9 +232,11 @@ export type Channel = {
    *   directly. The most common case (and the one we render as a
    *   nested track in playlist reorganize).
    * - `kind: "mixer_slot"` → controls a parameter on a plugin in a
-   *   mixer-insert slot. The destination encoding is more complex
-   *   (packs insert+slot indices) and we don't decode it yet —
-   *   `targetChannelIid` is undefined.
+   *   mixer-insert slot. Destination encoding RE'd 2026-05-09:
+   *     bit  13 (0x2000) → mixer-slot marker (1 = this kind)
+   *     bits 6..12       → mixer insert index (0..127)
+   *     bits 0..5        → slot index (0..63)
+   *   Surfaced as `targetInsertIndex` + `targetSlotIndex`.
    * - `kind: "unknown"` → 0xE3 was present but the destination
    *   doesn't match any known channel iid and doesn't fit the
    *   mixer-slot-encoding heuristic.
@@ -249,6 +251,10 @@ export type AutomationTarget = {
   kind: "channel" | "mixer_slot" | "unknown";
   /** Set only when `kind === "channel"` and the destination matches a real `Channel.iid`. */
   targetChannelIid?: number;
+  /** Set only when `kind === "mixer_slot"` — the mixer insert index decoded from bits 6..12 of the destination. */
+  targetInsertIndex?: number;
+  /** Set only when `kind === "mixer_slot"` — the slot index within the insert decoded from bits 0..5 of the destination. */
+  targetSlotIndex?: number;
   /** Parameter id within the target plugin/object. Bytes 8-9 of the 0xE3 payload, lower 15 bits. */
   paramId: number;
   /** True when the target parameter belongs to a VST plugin (high bit of bytes 8-9). */

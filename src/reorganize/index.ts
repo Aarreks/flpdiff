@@ -303,6 +303,24 @@ function collectLanes(project: FLPProject, arrangementId: number): Map<string, L
   const patternsById = new Map(project.patterns.map((p) => [p.id, p]));
   const allNotesByCh = notesByChannelIid(project);
 
+  // For mixer-slot automation nesting (D-57): build {insertIdx →
+  // [{iid, clipCount}]} so we can pick the dominant channel routed to
+  // each insert. The auto then nests under that channel's lane.
+  const clipCountByCh = new Map<number, number>();
+  for (const clip of arr.clips) {
+    const isPattern = clip.item_index > PATTERN_BASE;
+    if (isPattern) continue;
+    const iid = clip.item_index;
+    clipCountByCh.set(iid, (clipCountByCh.get(iid) ?? 0) + 1);
+  }
+  const channelClipCounts = new Map<number, Array<{ iid: number; clipCount: number }>>();
+  for (const ch of project.channels) {
+    if (ch.targetInsert === undefined || ch.targetInsert < 0) continue;
+    const arr = channelClipCounts.get(ch.targetInsert) ?? [];
+    arr.push({ iid: ch.iid, clipCount: clipCountByCh.get(ch.iid) ?? 0 });
+    channelClipCounts.set(ch.targetInsert, arr);
+  }
+
   const lanes = new Map<string, Lane>();
   for (let i = 0; i < arr.clips.length; i++) {
     const clip = arr.clips[i]!;
@@ -342,10 +360,37 @@ function collectLanes(project: FLPProject, arrangementId: number): Map<string, L
               classifyByPitchRange(targetNotes);
             if (targetGroup) group = targetGroup;
           }
+        } else if (
+          ch?.kind === "automation" &&
+          ch.automationTarget?.kind === "mixer_slot" &&
+          ch.automationTarget.targetInsertIndex !== undefined
+        ) {
+          // Mixer-slot automation: target is a plugin in a mixer
+          // slot (insert + slot decoded from the 0xE3 destination,
+          // see D-57). Find the dominant channel routed to that
+          // insert and nest under it. Falls back to "Other" family
+          // if nothing is routed there (e.g. master-bus effect).
+          isAutomation = true;
+          const targetInsertIdx = ch.automationTarget.targetInsertIndex;
+          const candidates = channelClipCounts.get(targetInsertIdx) ?? [];
+          if (candidates.length > 0) {
+            // Pick the channel with the most clips on the playlist —
+            // visually the "owner" of that mixer insert.
+            candidates.sort((a, b) => b.clipCount - a.clipCount);
+            automationTargetIid = candidates[0]!.iid;
+            const target = channelsByIid.get(automationTargetIid);
+            if (target) {
+              const targetNotes = allNotesByCh.get(target.iid) ?? [];
+              const targetGroup =
+                classifyChannel(target.name, target.sample_path) ??
+                classifyByPitchRange(targetNotes);
+              if (targetGroup) group = targetGroup;
+            }
+          }
         } else if (ch?.kind === "automation") {
-          // Mixer-slot or unknown automation: keep its own
-          // name-based classification but mark as auto so layout
-          // doesn't nest it (no target available).
+          // Unknown automation kind (no marker bit, no matching iid):
+          // keep its own name-based classification but mark as auto
+          // so layout doesn't nest it (no target available).
           isAutomation = true;
         }
       } else {

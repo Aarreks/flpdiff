@@ -242,9 +242,25 @@ linked channel.
 Real producer FLPs (`pp4_j1_129`, `h3_ys_64`, `edz_chords_28`)
 have automation channels controlling **mixer-slot plugin
 parameters** — e.g. `"Param. EQ 2 (Slot 7) - Serum - Band 1 freq"`.
-For those, `destination` is large (e.g. 0x24c5, 0x2820) and does
-NOT correspond to a channel iid. The encoding presumably packs
-`{insert_index, slot_index}` together; full decoding deferred.
+For those, the destination uint16 packs the (insert, slot) pair:
+
+```
+bit  13 (0x2000) → mixer-slot marker (1 = this kind, 0 = channel iid)
+bits  6..12      → mixer insert index (0..127)
+bits  0..5       → slot index (0..63)
+```
+
+Decode: `insert = (dest >> 6) & 0x7F`, `slot = dest & 0x3F`.
+Encode: `dest = 0x2000 | (insert << 6) | slot`.
+
+Verified across 57/57 mixer-slot `0xE3` samples in the local
+producer corpus (2026-05-09, D-57). Cross-validated against
+the FLP's named mixer inserts: where the auto channel name
+references an insert by name, the decoded `insert` matches the
+mixer's `MixerInsert.index` for that name. Many decodes also
+land on now-empty slots — users routinely delete plugins while
+keeping the legacy automation channel; the decode is still
+correct, the plugin just isn't there anymore.
 
 ### How flpdiff uses this
 
@@ -257,16 +273,23 @@ Reorganize v3 (next phase):
 2. When laying out playlist tracks, place each automation lane
    *immediately after* its target's lane, with `track.grouped = true`
    so FL renders the auto as a collapsible child of the instrument.
-3. Automations whose destination is a mixer slot or unknown encoding
-   stay in their own family block (no nesting attempted).
+3. Mixer-slot automations: find the dominant channel routed to the
+   target insert (max clip count on the playlist) and nest the auto
+   under that channel's lane, inheriting its family. Falls back to
+   the auto's own name-based classification when no channel is
+   routed there (e.g. master-bus effects).
+4. Automations of `kind: "unknown"` stay in their own family block
+   (no nesting attempted).
 
 ### What's NOT covered
 
-- Mixer-slot destination encoding (defer until needed)
 - The `_u4`/`_u5` magic constants — never seen anything other than
   `8` and `0x1D5` across 800+ events on the local corpus
 - Multiple linked targets per automation (haven't seen >1 `0xE3`
   per source_iid in the corpus)
+- The 6 high bits of `destination` (`bits 14..15`, mask `0xC000`).
+  Mostly zero in the corpus — single observed exception (`0x7481`,
+  insert ~82) had bits 14 and 12 set; cause not yet investigated
 
 ## `0xEE` TrackData — `grouped` flag at byte 47 + FL UI parent-inference
 
