@@ -13,6 +13,7 @@
  */
 import type { FLPProject } from "../parser/flp-project.ts";
 import type { FLPEvent } from "../parser/event.ts";
+import { decodeNotes, type Note } from "../model/pattern.ts";
 
 export class MutationError extends Error {
   constructor(
@@ -1457,3 +1458,233 @@ function encodeUtf16LeNullTerminated(s: string): Uint8Array {
 
 // Re-export the type discriminator for testing convenience.
 export type { FLPEvent };
+
+// --------------------------------------------------------------------------- //
+// F2.1 — Pattern notes encoder (0xE0)                                          //
+// --------------------------------------------------------------------------- //
+
+const NOTE_RECORD_SIZE = 24;
+
+/**
+ * Encode a single `Note` to its 24-byte on-disk record (opcode `0xE0`
+ * payload format). Inverse of `decodeNotes` in `model/pattern.ts`.
+ *
+ * Throws `MutationError` with code `INVALID_ARGS` on out-of-range
+ * fields (key `[0,131]`, position/length non-negative, channel_iid u16).
+ */
+export function encodeNote(note: Note): Uint8Array {
+  if (!Number.isInteger(note.position) || note.position < 0 || note.position > 0xffffffff) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `note.position must be u32, got ${note.position}`,
+    );
+  }
+  if (!Number.isInteger(note.length) || note.length < 0 || note.length > 0xffffffff) {
+    throw new MutationError("INVALID_ARGS", `note.length must be u32, got ${note.length}`);
+  }
+  if (!Number.isInteger(note.channel_iid) || note.channel_iid < 0 || note.channel_iid > 0xffff) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `note.channel_iid must be u16 (0..65535), got ${note.channel_iid}`,
+    );
+  }
+  if (!Number.isInteger(note.key) || note.key < 0 || note.key > 131) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `note.key must be in [0, 131] (FL MIDI range), got ${note.key}`,
+    );
+  }
+
+  const buf = new Uint8Array(NOTE_RECORD_SIZE);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, note.position, true);
+  view.setUint16(4, (note.flags ?? 0) & 0xffff, true);
+  view.setUint16(6, note.channel_iid, true);
+  view.setUint32(8, note.length, true);
+  view.setUint16(12, note.key, true);
+  view.setUint16(14, (note.group ?? 0) & 0xffff, true);
+  buf[16] = (note.fine_pitch ?? 120) & 0xff;
+  // byte 17 reserved (left as 0)
+  buf[18] = (note.release ?? 64) & 0xff;
+  buf[19] = (note.midi_channel ?? 0) & 0xff;
+  buf[20] = (note.pan ?? 64) & 0xff;
+  buf[21] = (note.velocity ?? 100) & 0xff;
+  buf[22] = (note.mod_x ?? 128) & 0xff;
+  buf[23] = (note.mod_y ?? 128) & 0xff;
+  return buf;
+}
+
+function encodePatternNotes(notes: readonly Note[]): Uint8Array {
+  const out = new Uint8Array(notes.length * NOTE_RECORD_SIZE);
+  for (let i = 0; i < notes.length; i++) {
+    out.set(encodeNote(notes[i]!), i * NOTE_RECORD_SIZE);
+  }
+  return out;
+}
+
+/**
+ * Locate a pattern's event-stream scope: the slice from its `0x41`
+ * marker through the byte before the next pattern boundary
+ * (next `0x41` or the start of the arrangement section `0x63`, whichever
+ * comes first). Returns `null` if the pattern doesn't exist.
+ */
+function findPatternScope(
+  events: readonly FLPEvent[],
+  patternId: number,
+): { startIdx: number; endIdx: number } | null {
+  let start = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW && ev.value === patternId) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  for (let i = start + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW) return { startIdx: start, endIdx: i };
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) {
+      return { startIdx: start, endIdx: i };
+    }
+  }
+  return { startIdx: start, endIdx: events.length };
+}
+
+function collectExistingNotes(events: readonly FLPEvent[], scope: {
+  startIdx: number;
+  endIdx: number;
+}): Note[] {
+  const out: Note[] = [];
+  for (let i = scope.startIdx + 1; i < scope.endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_PATTERN_NOTES) {
+      for (const n of decodeNotes(ev.payload)) out.push(n);
+    }
+  }
+  return out;
+}
+
+/**
+ * Replace every note on `patternId` with `notes`. All existing
+ * `0xE0` events inside the pattern's scope are dropped; if `notes` is
+ * non-empty a single concatenated `0xE0` is inserted right after the
+ * pattern's `0xC1` name event (or right after its `0x41` marker if the
+ * pattern has no name event).
+ *
+ * Throws `EVENT_NOT_FOUND` if the pattern id doesn't exist, and
+ * `INVALID_ARGS` for non-positive `patternId` or invalid note records
+ * (caught by `encodeNote`).
+ */
+export function setPatternNotes(
+  project: FLPProject,
+  patternId: number,
+  notes: readonly Note[],
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+
+  // Validate-encode upfront so a single bad note doesn't leave the
+  // project half-mutated; the encoded payload also gets reused below.
+  const encoded = notes.length > 0 ? encodePatternNotes(notes) : null;
+
+  // Drop existing 0xE0 events inside the target scope.
+  const events: FLPEvent[] = [];
+  for (let i = 0; i < project.events.length; i++) {
+    const ev = project.events[i]!;
+    if (i > scope.startIdx && i < scope.endIdx && ev.opcode === OP_PATTERN_NOTES) continue;
+    events.push(ev);
+  }
+
+  if (encoded === null) return { ...project, events };
+
+  // The scope shifts when we drop events; re-locate.
+  const newScope = findPatternScope(events, patternId)!;
+  let insertAt = newScope.startIdx + 1;
+  for (let i = newScope.startIdx + 1; i < newScope.endIdx; i++) {
+    if (events[i]!.opcode === OP_PATTERN_NAME) {
+      insertAt = i + 1;
+      break;
+    }
+  }
+  events.splice(insertAt, 0, { kind: "blob", opcode: OP_PATTERN_NOTES, payload: encoded });
+  return { ...project, events };
+}
+
+/**
+ * Append one note to a pattern. Existing notes are preserved; the new
+ * note is added at the end of the (rewritten, single) `0xE0` blob.
+ *
+ * Note: this rewrites the pattern's notes blob to a single `0xE0`
+ * record even if the source had multiple consecutive `0xE0` events
+ * (FL emits one but reads concatenations correctly). Reading round-
+ * trips identically.
+ */
+export function addPatternNote(
+  project: FLPProject,
+  patternId: number,
+  note: Note,
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  // Validate eagerly — throws INVALID_ARGS on bad note.
+  encodeNote(note);
+  const existing = collectExistingNotes(project.events, scope);
+  return setPatternNotes(project, patternId, [...existing, note]);
+}
+
+/**
+ * Remove a note from a pattern. `selector` is either a 0-based index
+ * into the existing note list or a predicate `(note, index) => boolean`
+ * that returns `true` for every note that should be removed.
+ *
+ * Throws `INVALID_ARGS` if `selector` is a number out of range,
+ * `EVENT_NOT_FOUND` if the pattern id doesn't exist.
+ */
+export function removePatternNote(
+  project: FLPProject,
+  patternId: number,
+  selector: number | ((note: Note, index: number) => boolean),
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+
+  let kept: Note[];
+  if (typeof selector === "number") {
+    if (!Number.isInteger(selector) || selector < 0 || selector >= existing.length) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `note index ${selector} out of range [0, ${existing.length})`,
+      );
+    }
+    kept = existing.filter((_, i) => i !== selector);
+  } else {
+    kept = existing.filter((n, i) => !selector(n, i));
+  }
+  return setPatternNotes(project, patternId, kept);
+}

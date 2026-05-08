@@ -21,6 +21,10 @@ import {
   addClip,
   removeClip,
   moveClip,
+  addPatternNote,
+  setPatternNotes,
+  removePatternNote,
+  encodeNote,
   MutationError,
 } from "../src/mutations/index.ts";
 import { buildArrangements } from "../src/parser/project-builder.ts";
@@ -617,5 +621,279 @@ describe("serializer + mutation = round-trip identity for unchanged FLPs", () =>
         throw new Error(`byte mismatch at offset ${i}: ${bytes[i]} vs ${original[i]}`);
       }
     }
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F2.1 — Pattern notes encoder (0xE0)                                          //
+// --------------------------------------------------------------------------- //
+
+const NOTE_FLAG_SLIDE = 0x08;
+
+function noteAt(opts: {
+  position: number;
+  channel_iid: number;
+  length: number;
+  key: number;
+  velocity?: number;
+  flags?: number;
+}) {
+  return {
+    position: opts.position,
+    channel_iid: opts.channel_iid,
+    length: opts.length,
+    key: opts.key,
+    flags: opts.flags ?? 0,
+    group: 0,
+    fine_pitch: 120,
+    release: 64,
+    midi_channel: 0,
+    pan: 64,
+    velocity: opts.velocity ?? 100,
+    mod_x: 128,
+    mod_y: 128,
+  };
+}
+
+describe("encodeNote — pure record encoder", () => {
+  test("encodes a 24-byte record byte-exact (round-trip via decodeNotes)", () => {
+    // Take a known-valid note from the parsed fixture; encode it; concat
+    // with itself; decode; expect both copies match the input exactly.
+    const project = loadProject(FIXTURE);
+    const pattern = project.patterns.find((p) => p.id === 1);
+    expect(pattern?.notes.length).toBeGreaterThan(0);
+    const original = pattern!.notes[0]!;
+
+    const blob = encodeNote(original);
+    expect(blob.byteLength).toBe(24);
+
+    // Two-record blob to make sure the encoder is offset-friendly.
+    const doubled = new Uint8Array(48);
+    doubled.set(blob, 0);
+    doubled.set(blob, 24);
+    // Re-decode by going through the public model decoder.
+    // The decode helper isn't re-exported from mutations/, so reach
+    // into the model directly.
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { decodeNotes } = require("../src/model/pattern.ts") as {
+      decodeNotes: (p: Uint8Array) => unknown[];
+    };
+    const decoded = decodeNotes(doubled);
+    expect(decoded.length).toBe(2);
+    expect(decoded[0]).toEqual(original);
+    expect(decoded[1]).toEqual(original);
+  });
+
+  test("rejects key out of range [0, 131]", () => {
+    expect(() => encodeNote(noteAt({ position: 0, channel_iid: 0, length: 96, key: -1 }))).toThrow(
+      MutationError,
+    );
+    expect(() =>
+      encodeNote(noteAt({ position: 0, channel_iid: 0, length: 96, key: 132 })),
+    ).toThrow(MutationError);
+  });
+
+  test("rejects negative position or length", () => {
+    expect(() =>
+      encodeNote(noteAt({ position: -1, channel_iid: 0, length: 96, key: 60 })),
+    ).toThrow(MutationError);
+    expect(() => encodeNote(noteAt({ position: 0, channel_iid: 0, length: -1, key: 60 }))).toThrow(
+      MutationError,
+    );
+  });
+
+  test("rejects channel_iid out of u16 range", () => {
+    expect(() =>
+      encodeNote(noteAt({ position: 0, channel_iid: -1, length: 96, key: 60 })),
+    ).toThrow(MutationError);
+    expect(() =>
+      encodeNote(noteAt({ position: 0, channel_iid: 70000, length: 96, key: 60 })),
+    ).toThrow(MutationError);
+  });
+});
+
+describe("addPatternNote", () => {
+  test("appends a note to an existing pattern (round-trip via serialize)", () => {
+    const project = loadProject(FIXTURE);
+    const before = project.patterns.find((p) => p.id === 1);
+    expect(before).toBeDefined();
+    const baselineCount = before!.notes.length;
+
+    const newNote = noteAt({
+      position: 96, // beat 1 at PPQ=96
+      channel_iid: 1,
+      length: 48,
+      key: 67, // G3
+      velocity: 110,
+    });
+    const mutated = addPatternNote(project, 1, newNote);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.notes.length).toBe(baselineCount + 1);
+    const last = pattern.notes[pattern.notes.length - 1]!;
+    expect(last.position).toBe(96);
+    expect(last.channel_iid).toBe(1);
+    expect(last.length).toBe(48);
+    expect(last.key).toBe(67);
+    expect(last.velocity).toBe(110);
+  });
+
+  test("creating a 0xE0 event for an unrelated pattern does NOT corrupt this one", () => {
+    // Simulates "add note to pattern that already has notes"; the
+    // encoder must not drop existing notes.
+    const project = loadProject(FIXTURE);
+    const baseline = project.patterns.find((p) => p.id === 1)!.notes.slice();
+
+    const note = noteAt({ position: 192, channel_iid: 1, length: 24, key: 72 });
+    const mutated = addPatternNote(project, 1, note);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.notes.length).toBe(baseline.length + 1);
+    // Existing notes preserved (compare by position+key+channel_iid; full-eq
+    // comparison would also work because we don't touch them).
+    for (const original of baseline) {
+      expect(
+        pattern.notes.some(
+          (n) =>
+            n.position === original.position &&
+            n.key === original.key &&
+            n.channel_iid === original.channel_iid,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test("preserves slide-flag round-trip", () => {
+    const project = loadProject(FIXTURE);
+    const note = {
+      ...noteAt({ position: 0, channel_iid: 1, length: 48, key: 60 }),
+      flags: NOTE_FLAG_SLIDE,
+    };
+    const mutated = addPatternNote(project, 1, note);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+    const slideNote = pattern.notes.find((n) => (n.flags & NOTE_FLAG_SLIDE) !== 0);
+    expect(slideNote).toBeDefined();
+    expect(slideNote?.slide).toBe(true);
+  });
+
+  test("EVENT_NOT_FOUND when pattern id doesn't exist", () => {
+    const project = loadProject(FIXTURE);
+    const note = noteAt({ position: 0, channel_iid: 0, length: 48, key: 60 });
+    expect(() => addPatternNote(project, 999, note)).toThrow(MutationError);
+    try {
+      addPatternNote(project, 999, note);
+      throw new Error("expected throw");
+    } catch (e) {
+      if (e instanceof MutationError) expect(e.code).toBe("EVENT_NOT_FOUND");
+    }
+  });
+
+  test("rejects iid < 1 (FL is 1-indexed for patterns)", () => {
+    const project = loadProject(FIXTURE);
+    const note = noteAt({ position: 0, channel_iid: 0, length: 48, key: 60 });
+    expect(() => addPatternNote(project, 0, note)).toThrow(MutationError);
+    expect(() => addPatternNote(project, -1, note)).toThrow(MutationError);
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.patterns.find((p) => p.id === 1)!.notes.length;
+    addPatternNote(project, 1, noteAt({ position: 0, channel_iid: 1, length: 48, key: 60 }));
+    expect(project.patterns.find((p) => p.id === 1)!.notes.length).toBe(beforeCount);
+  });
+});
+
+describe("setPatternNotes", () => {
+  test("replaces all notes on a pattern (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    const replacement = [
+      noteAt({ position: 0, channel_iid: 1, length: 48, key: 60 }),
+      noteAt({ position: 96, channel_iid: 1, length: 48, key: 64 }),
+      noteAt({ position: 192, channel_iid: 1, length: 48, key: 67 }),
+    ];
+    const mutated = setPatternNotes(project, 1, replacement);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.notes.length).toBe(3);
+    const positions = pattern.notes.map((n) => n.position).sort((a, b) => a - b);
+    expect(positions).toEqual([0, 96, 192]);
+    const keys = pattern.notes.map((n) => n.key).sort((a, b) => a - b);
+    expect(keys).toEqual([60, 64, 67]);
+  });
+
+  test("clearing notes (empty array) removes all 0xE0 events from the pattern", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setPatternNotes(project, 1, []);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+    expect(pattern.notes.length).toBe(0);
+  });
+
+  test("EVENT_NOT_FOUND on unknown pattern", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setPatternNotes(project, 999, [])).toThrow(MutationError);
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.patterns.find((p) => p.id === 1)!.notes.length;
+    setPatternNotes(project, 1, []);
+    expect(project.patterns.find((p) => p.id === 1)!.notes.length).toBe(beforeCount);
+  });
+});
+
+describe("removePatternNote", () => {
+  test("removes by index (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    // Seed three notes via setPatternNotes so we have a known-shape baseline.
+    const seeded = setPatternNotes(project, 1, [
+      noteAt({ position: 0, channel_iid: 1, length: 48, key: 60 }),
+      noteAt({ position: 96, channel_iid: 1, length: 48, key: 64 }),
+      noteAt({ position: 192, channel_iid: 1, length: 48, key: 67 }),
+    ]);
+    const mutated = removePatternNote(seeded, 1, 1); // remove middle (key=64)
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.notes.length).toBe(2);
+    const keys = pattern.notes.map((n) => n.key).sort((a, b) => a - b);
+    expect(keys).toEqual([60, 67]);
+  });
+
+  test("removes by predicate (e.g., all notes with key < 65)", () => {
+    const project = loadProject(FIXTURE);
+    const seeded = setPatternNotes(project, 1, [
+      noteAt({ position: 0, channel_iid: 1, length: 48, key: 48 }),
+      noteAt({ position: 96, channel_iid: 1, length: 48, key: 60 }),
+      noteAt({ position: 192, channel_iid: 1, length: 48, key: 72 }),
+    ]);
+    const mutated = removePatternNote(seeded, 1, (n) => n.key < 65);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.notes.length).toBe(1);
+    expect(pattern.notes[0]!.key).toBe(72);
+  });
+
+  test("rejects out-of-range index", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => removePatternNote(project, 1, -1)).toThrow(MutationError);
+    expect(() => removePatternNote(project, 1, 9999)).toThrow(MutationError);
+  });
+
+  test("EVENT_NOT_FOUND on unknown pattern id", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => removePatternNote(project, 999, 0)).toThrow(MutationError);
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.patterns.find((p) => p.id === 1)!.notes.length;
+    removePatternNote(project, 1, 0);
+    expect(project.patterns.find((p) => p.id === 1)!.notes.length).toBe(beforeCount);
   });
 });

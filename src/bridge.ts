@@ -58,11 +58,15 @@ import {
   addClip,
   removeClip,
   moveClip,
+  addPatternNote,
+  setPatternNotes,
+  removePatternNote,
   MutationError,
   type RGBA,
   type ClipPlacement,
   type ClipMatch,
 } from "./mutations/index.ts";
+import type { Note } from "./model/pattern.ts";
 import { planReorganize, reorganizeProject } from "./reorganize/index.ts";
 
 type BridgeRequest = {
@@ -116,6 +120,9 @@ const WRITE_KINDS = new Set([
   "remove_clip",
   "move_clip",
   "reorganize_project",
+  "add_pattern_note",
+  "set_pattern_notes",
+  "remove_pattern_note",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -169,6 +176,53 @@ function parseMatchArg(args: Record<string, unknown>): ClipMatch {
     out.kind = args["kind"];
   }
   return out;
+}
+
+/**
+ * Build a `Note` from flat bridge args (or from a single nested object).
+ * `addPatternNote` accepts position/channel_iid/length/key as required;
+ * everything else falls back to FL's neutral defaults so the LLM can
+ * emit minimal calls (and slide-flag is the bit user usually wants).
+ */
+function parseNoteArgs(args: Record<string, unknown>): Note {
+  const num = (k: string, required: boolean, def?: number): number => {
+    const raw = args[k];
+    if (raw === undefined || raw === null) {
+      if (required) {
+        throw new MutationError("INVALID_ARGS", `args.${k} is required (number)`);
+      }
+      return def!;
+    }
+    const v = Number(raw);
+    if (!Number.isFinite(v)) {
+      throw new MutationError("INVALID_ARGS", `args.${k} must be a finite number, got ${raw}`);
+    }
+    return v;
+  };
+  let flags = num("flags", false, 0);
+  if (args["slide"] !== undefined) {
+    if (typeof args["slide"] !== "boolean") {
+      throw new MutationError("INVALID_ARGS", "args.slide must be boolean when provided");
+    }
+    if (args["slide"]) flags |= 0x08;
+    else flags &= ~0x08;
+  }
+  return {
+    position: num("position", true),
+    channel_iid: num("channel_iid", true),
+    length: num("length", true),
+    key: num("key", true),
+    flags,
+    slide: (flags & 0x08) !== 0,
+    group: num("group", false, 0),
+    fine_pitch: num("fine_pitch", false, 120),
+    release: num("release", false, 64),
+    midi_channel: num("midi_channel", false, 0),
+    pan: num("pan", false, 64),
+    velocity: num("velocity", false, 100),
+    mod_x: num("mod_x", false, 128),
+    mod_y: num("mod_y", false, 128),
+  };
 }
 
 function parseRGBAArg(args: Record<string, unknown>): RGBA {
@@ -250,6 +304,26 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "add_family_separators",
     "dry_run",
   ]),
+  add_pattern_note: new Set([
+    "path",
+    "pattern_id",
+    "position",
+    "channel_iid",
+    "length",
+    "key",
+    "velocity",
+    "pan",
+    "fine_pitch",
+    "release",
+    "midi_channel",
+    "mod_x",
+    "mod_y",
+    "group",
+    "flags",
+    "slide",
+  ]),
+  set_pattern_notes: new Set(["path", "pattern_id", "notes"]),
+  remove_pattern_note: new Set(["path", "pattern_id", "index"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -282,7 +356,11 @@ function normaliseArgs(
   const out: Record<string, unknown> = {};
   const unknown: string[] = [];
   for (const [key, value] of Object.entries(rawArgs)) {
-    const canonical = ARG_ALIASES[key] ?? key;
+    // Prefer the key as-is when the kind already accepts it. Without this
+    // check, args like `channel_iid` get rewritten to `iid` via the alias
+    // table even on kinds (e.g. `add_pattern_note`) where the canonical
+    // name IS `channel_iid`.
+    const canonical = allowed.has(key) ? key : (ARG_ALIASES[key] ?? key);
     if (!allowed.has(canonical)) {
       unknown.push(key);
       continue;
@@ -574,6 +652,53 @@ function executeWrite(
           plan: result.plan,
         },
       };
+    } else if (kind === "add_pattern_note") {
+      const patternId = Number(args["pattern_id"]);
+      if (!Number.isFinite(patternId)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.pattern_id is required (positive integer)",
+        );
+      }
+      mutated = addPatternNote(project, patternId, parseNoteArgs(args));
+    } else if (kind === "set_pattern_notes") {
+      const patternId = Number(args["pattern_id"]);
+      if (!Number.isFinite(patternId)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.pattern_id is required (positive integer)",
+        );
+      }
+      const rawNotes = args["notes"];
+      if (!Array.isArray(rawNotes)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.notes is required (array of note objects, possibly empty)",
+        );
+      }
+      const notes: Note[] = rawNotes.map((n, i) => {
+        if (!n || typeof n !== "object") {
+          throw new MutationError("INVALID_ARGS", `args.notes[${i}] must be an object`);
+        }
+        return parseNoteArgs(n as Record<string, unknown>);
+      });
+      mutated = setPatternNotes(project, patternId, notes);
+    } else if (kind === "remove_pattern_note") {
+      const patternId = Number(args["pattern_id"]);
+      const index = Number(args["index"]);
+      if (!Number.isFinite(patternId)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.pattern_id is required (positive integer)",
+        );
+      }
+      if (!Number.isFinite(index)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.index is required (non-negative integer)",
+        );
+      }
+      mutated = removePatternNote(project, patternId, index);
     } else {
       return {
         ok: false,
