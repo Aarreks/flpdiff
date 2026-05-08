@@ -1885,3 +1885,172 @@ export function removePatternController(
   }
   return setPatternControllers(project, patternId, kept);
 }
+
+// --------------------------------------------------------------------------- //
+// F2.3 — Pattern + channel creation                                            //
+// --------------------------------------------------------------------------- //
+
+const OP_CHANNEL_TYPE = 0x15; // u8: 0=sampler, 2/4=instrument, 3=layer, 5=automation
+const OP_PLUGIN_INTERNAL_NAME = 0xc9; // text blob (UTF-16LE)
+
+/**
+ * Channel kind input accepted by `createChannel`. Maps to the on-disk
+ * `0x15` u8 byte. `"sampler"` is the safe default (FL's built-in
+ * sampler renders fine with no plugin attached). Other kinds require
+ * additional opcodes (instrument plugin state, automation point
+ * stream, layer membership) that this v1 helper does NOT emit — for
+ * those, clone an existing channel via a different helper.
+ */
+export type ChannelKindInput = "sampler" | "instrument" | "automation" | "layer";
+
+const _CHANNEL_KIND_TO_BYTE: Record<ChannelKindInput, number> = {
+  sampler: 0,
+  instrument: 2,
+  layer: 3,
+  automation: 5,
+};
+
+/**
+ * Find a safe insertion index for a NEW pattern or channel scope:
+ * just before the first `0x63` (arrangement opener). All FL 25 saves
+ * place patterns + channels before arrangements; mixer events come
+ * after. If no `0x63` exists (rare; corrupted or pre-arrangement
+ * snapshot), fall back to end-of-events.
+ */
+function findInsertionBeforeArrangements(events: readonly FLPEvent[]): number {
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_ARRANGEMENT_NEW) return i;
+  }
+  return events.length;
+}
+
+function nextPatternId(events: readonly FLPEvent[]): number {
+  let max = 0;
+  for (const ev of events) {
+    if (ev.kind === "u16" && ev.opcode === OP_PATTERN_NEW && ev.value > max) max = ev.value;
+  }
+  return max + 1;
+}
+
+function nextChannelIid(events: readonly FLPEvent[]): number {
+  let max = -1;
+  for (const ev of events) {
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL && ev.value > max) max = ev.value;
+  }
+  // Channels are 0-indexed; if none exist, the next is 0. Otherwise max + 1.
+  return max + 1;
+}
+
+/**
+ * Create a brand-new empty pattern. Returns `{project, id}` where
+ * `id` is the assigned pattern id (one greater than the current max,
+ * never reused even if there are gaps from deletions).
+ *
+ * Minimum on-disk shape: `[0x41 newId u16, 0xC1 name blob]`. FL
+ * fills in defaults for length / color / looped / notes / controllers
+ * on read.
+ *
+ * Insertion point: just before the first `0x63` (arrangement opener).
+ * The pattern shows up in the FL pattern selector after a re-load.
+ */
+export function createPattern(
+  project: FLPProject,
+  opts: { name?: string } = {},
+): { project: FLPProject; id: number } {
+  const name = opts.name ?? "";
+  if (typeof name !== "string") {
+    throw new MutationError("INVALID_ARGS", `opts.name must be a string when provided`);
+  }
+  if (name.length > 256) {
+    throw new MutationError("INVALID_ARGS", `opts.name too long (${name.length} chars, max 256)`);
+  }
+
+  const newId = nextPatternId(project.events);
+  const insertAt = findInsertionBeforeArrangements(project.events);
+
+  const newEvents: FLPEvent[] = [
+    { kind: "u16", opcode: OP_PATTERN_NEW, value: newId },
+    {
+      kind: "blob",
+      opcode: OP_PATTERN_NAME,
+      payload: encodeUtf16LeNullTerminated(name),
+    },
+  ];
+
+  const events = [...project.events];
+  events.splice(insertAt, 0, ...newEvents);
+  return { project: { ...project, events }, id: newId };
+}
+
+/**
+ * Create a brand-new empty channel. Returns `{project, iid}` where
+ * `iid` is the assigned channel iid (one greater than the current max).
+ *
+ * Minimum on-disk shape: `[0x40 newIid u16, 0x15 kindByte u8, 0xCB
+ * name blob]`. The `0x15` byte tells FL the channel kind (defaults to
+ * sampler = `0` so FL renders the built-in sampler with no plugin
+ * required). Other kinds (instrument / automation / layer) need
+ * additional supporting opcodes that this v1 helper does NOT emit —
+ * clone an existing channel of that kind instead.
+ *
+ * The legacy `header.n_channels` u16 is intentionally NOT bumped:
+ * modern FL writes 0 there and the channel count is derived from the
+ * event stream (see `flpdiff/src/parser/flp-project.ts:14-18`).
+ *
+ * Insertion point: just before the first `0x63` (arrangement opener).
+ */
+export function createChannel(
+  project: FLPProject,
+  opts: { name?: string; kind?: ChannelKindInput } = {},
+): { project: FLPProject; iid: number } {
+  const name = opts.name ?? "";
+  const kind = opts.kind ?? "sampler";
+  if (typeof name !== "string") {
+    throw new MutationError("INVALID_ARGS", `opts.name must be a string when provided`);
+  }
+  if (name.length > 256) {
+    throw new MutationError("INVALID_ARGS", `opts.name too long (${name.length} chars, max 256)`);
+  }
+  if (!(kind in _CHANNEL_KIND_TO_BYTE)) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `opts.kind must be one of: sampler, instrument, automation, layer (got ${kind})`,
+    );
+  }
+
+  const newIid = nextChannelIid(project.events);
+  if (newIid > 0xffff) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `cannot allocate new channel iid: max u16 (${0xffff}) reached`,
+    );
+  }
+
+  const insertAt = findInsertionBeforeArrangements(project.events);
+
+  const newEvents: FLPEvent[] = [
+    { kind: "u16", opcode: OP_NEW_CHANNEL, value: newIid },
+    { kind: "u8", opcode: OP_CHANNEL_TYPE, value: _CHANNEL_KIND_TO_BYTE[kind] },
+    {
+      kind: "blob",
+      opcode: OP_NAME,
+      payload: encodeUtf16LeNullTerminated(name),
+    },
+  ];
+
+  // For instrument kind, emit an empty plugin-internal-name slot so FL
+  // recognises the channel as a placeholder for a future plugin. Sampler
+  // doesn't need it.
+  if (kind === "instrument") {
+    newEvents.splice(2, 0, {
+      kind: "blob",
+      opcode: OP_PLUGIN_INTERNAL_NAME,
+      payload: encodeUtf16LeNullTerminated(""),
+    });
+  }
+
+  const events = [...project.events];
+  events.splice(insertAt, 0, ...newEvents);
+  return { project: { ...project, events }, iid: newIid };
+}

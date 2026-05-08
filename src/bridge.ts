@@ -64,6 +64,9 @@ import {
   addPatternController,
   setPatternControllers,
   removePatternController,
+  createPattern,
+  createChannel,
+  type ChannelKindInput,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -129,6 +132,8 @@ const WRITE_KINDS = new Set([
   "add_pattern_controller",
   "set_pattern_controllers",
   "remove_pattern_controller",
+  "create_pattern",
+  "create_channel",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -367,6 +372,8 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   ]),
   set_pattern_controllers: new Set(["path", "pattern_id", "controllers"]),
   remove_pattern_controller: new Set(["path", "pattern_id", "index"]),
+  create_pattern: new Set(["path", "name"]),
+  create_channel: new Set(["path", "name", "kind"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -789,6 +796,56 @@ function executeWrite(
         );
       }
       mutated = removePatternController(project, patternId, index);
+    } else if (kind === "create_pattern") {
+      const name = args["name"];
+      if (name !== undefined && typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name must be string when provided");
+      }
+      const result = createPattern(project, { name });
+      const bytes = serializeFLPProject(result.project);
+      writeFileSync(resolve(path), bytes);
+      return {
+        ok: true,
+        kind,
+        result: {
+          path: resolve(path),
+          bytes_written: bytes.byteLength,
+          pattern_id: result.id,
+        },
+      };
+    } else if (kind === "create_channel") {
+      const name = args["name"];
+      const kindArg = args["kind"];
+      if (name !== undefined && typeof name !== "string") {
+        throw new MutationError("INVALID_ARGS", "args.name must be string when provided");
+      }
+      if (
+        kindArg !== undefined &&
+        kindArg !== "sampler" &&
+        kindArg !== "instrument" &&
+        kindArg !== "automation" &&
+        kindArg !== "layer"
+      ) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.kind must be one of: sampler, instrument, automation, layer",
+        );
+      }
+      const result = createChannel(project, {
+        name,
+        kind: kindArg as ChannelKindInput | undefined,
+      });
+      const bytes = serializeFLPProject(result.project);
+      writeFileSync(resolve(path), bytes);
+      return {
+        ok: true,
+        kind,
+        result: {
+          path: resolve(path),
+          bytes_written: bytes.byteLength,
+          channel_iid: result.iid,
+        },
+      };
     } else {
       return {
         ok: false,

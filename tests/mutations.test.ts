@@ -29,6 +29,8 @@ import {
   setPatternControllers,
   removePatternController,
   encodeController,
+  createPattern,
+  createChannel,
   MutationError,
 } from "../src/mutations/index.ts";
 import { buildArrangements } from "../src/parser/project-builder.ts";
@@ -1127,5 +1129,176 @@ describe("removePatternController", () => {
   test("EVENT_NOT_FOUND on unknown pattern id", () => {
     const project = loadProject(FIXTURE);
     expect(() => removePatternController(project, 999, 0)).toThrow(MutationError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F2.3 — Pattern + channel creation                                            //
+// --------------------------------------------------------------------------- //
+
+describe("createPattern", () => {
+  test("creates a new pattern with id = max(existing) + 1 (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    const beforeIds = project.patterns.map((p) => p.id);
+    const beforeMax = beforeIds.length > 0 ? Math.max(...beforeIds) : 0;
+
+    const { project: mutated, id } = createPattern(project, { name: "NewVerse" });
+    expect(id).toBe(beforeMax + 1);
+
+    const reparsed = reparse(mutated);
+    const created = reparsed.patterns.find((p) => p.id === id);
+    expect(created).toBeDefined();
+    expect(created?.name).toBe("NewVerse");
+    expect(created?.notes.length).toBe(0);
+    expect(created?.controllers.length).toBe(0);
+  });
+
+  test("default name is empty string when not supplied", () => {
+    const project = loadProject(FIXTURE);
+    const { project: mutated, id } = createPattern(project);
+    const reparsed = reparse(mutated);
+    const created = reparsed.patterns.find((p) => p.id === id);
+    expect(created).toBeDefined();
+    // Empty name reads back as "" via decodeTextEvent (or undefined if FL
+    // strips). Accept either as long as it's not garbage.
+    expect(["", undefined]).toContain(created?.name);
+  });
+
+  test("preserves existing patterns (notes, controllers, color)", () => {
+    const project = loadProject(FIXTURE);
+    const before = project.patterns.find((p) => p.id === 1)!;
+    const beforeNoteCount = before.notes.length;
+
+    const { project: mutated } = createPattern(project, { name: "added" });
+    const reparsed = reparse(mutated);
+    const original = reparsed.patterns.find((p) => p.id === 1)!;
+    expect(original.notes.length).toBe(beforeNoteCount);
+    expect(original.name).toBe(before.name);
+  });
+
+  test("subsequent addPatternNote on the new pattern works", () => {
+    const project = loadProject(FIXTURE);
+    const { project: withPattern, id } = createPattern(project, { name: "melody" });
+    const note = noteAt({ position: 0, channel_iid: 1, length: 96, key: 60 });
+    const { project: withNote } = { project: addPatternNote(withPattern, id, note) };
+    const reparsed = reparse(withNote);
+    const created = reparsed.patterns.find((p) => p.id === id)!;
+    expect(created.notes.length).toBe(1);
+    expect(created.notes[0]!.key).toBe(60);
+  });
+
+  test("rejects non-string name", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => createPattern(project, { name: 123 as unknown as string })).toThrow(
+      MutationError,
+    );
+  });
+
+  test("rejects oversize name", () => {
+    const project = loadProject(FIXTURE);
+    const huge = "x".repeat(257);
+    expect(() => createPattern(project, { name: huge })).toThrow(MutationError);
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.patterns.length;
+    createPattern(project, { name: "added" });
+    expect(project.patterns.length).toBe(beforeCount);
+  });
+
+  test("two consecutive creates yield distinct ids", () => {
+    const project = loadProject(FIXTURE);
+    const { project: p1, id: id1 } = createPattern(project, { name: "a" });
+    const { project: p2, id: id2 } = createPattern(p1, { name: "b" });
+    expect(id2).toBe(id1 + 1);
+    const reparsed = reparse(p2);
+    const ids = reparsed.patterns.map((p) => p.id);
+    expect(ids).toContain(id1);
+    expect(ids).toContain(id2);
+  });
+});
+
+describe("createChannel", () => {
+  test("creates a sampler channel with iid = max(existing) + 1 (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    const beforeIids = project.channels.map((c) => c.iid);
+    const beforeMax = beforeIids.length > 0 ? Math.max(...beforeIids) : -1;
+
+    const { project: mutated, iid } = createChannel(project, { name: "MySynth" });
+    expect(iid).toBe(beforeMax + 1);
+
+    const reparsed = reparse(mutated);
+    const created = reparsed.channels.find((c) => c.iid === iid);
+    expect(created).toBeDefined();
+    expect(created?.name).toBe("MySynth");
+    expect(created?.kind).toBe("sampler");
+  });
+
+  test("kind=instrument yields instrument-classified channel", () => {
+    const project = loadProject(FIXTURE);
+    const { project: mutated, iid } = createChannel(project, { name: "Plug", kind: "instrument" });
+    const reparsed = reparse(mutated);
+    const created = reparsed.channels.find((c) => c.iid === iid);
+    expect(created?.kind).toBe("instrument");
+  });
+
+  test("kind=automation yields automation-classified channel", () => {
+    const project = loadProject(FIXTURE);
+    const { project: mutated, iid } = createChannel(project, {
+      name: "VolAuto",
+      kind: "automation",
+    });
+    const reparsed = reparse(mutated);
+    const created = reparsed.channels.find((c) => c.iid === iid);
+    expect(created?.kind).toBe("automation");
+  });
+
+  test("preserves existing channels", () => {
+    const project = loadProject(FIXTURE);
+    const beforeKick = project.channels.find((c) => c.name === "Kick");
+    expect(beforeKick).toBeDefined();
+
+    const { project: mutated } = createChannel(project, { name: "Newchan" });
+    const reparsed = reparse(mutated);
+    const kick = reparsed.channels.find((c) => c.name === "Kick");
+    expect(kick).toBeDefined();
+    expect(kick!.iid).toBe(beforeKick!.iid);
+  });
+
+  test("rejects unknown kind", () => {
+    const project = loadProject(FIXTURE);
+    expect(() =>
+      createChannel(project, { name: "x", kind: "synthesizer" as never }),
+    ).toThrow(MutationError);
+  });
+
+  test("rejects non-string name", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => createChannel(project, { name: 5 as unknown as string })).toThrow(MutationError);
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.channels.length;
+    createChannel(project, { name: "added" });
+    expect(project.channels.length).toBe(beforeCount);
+  });
+
+  test("two consecutive creates yield distinct iids", () => {
+    const project = loadProject(FIXTURE);
+    const { project: p1, iid: iid1 } = createChannel(project, { name: "a" });
+    const { project: p2, iid: iid2 } = createChannel(p1, { name: "b" });
+    expect(iid2).toBe(iid1 + 1);
+  });
+
+  test("subsequent setChannelColor on the new channel works", () => {
+    const project = loadProject(FIXTURE);
+    const { project: withChan, iid } = createChannel(project, { name: "Colored" });
+    const colored = setChannelColor(withChan, iid, { r: 255, g: 100, b: 50 });
+    const reparsed = reparse(colored);
+    const c = reparsed.channels.find((x) => x.iid === iid);
+    expect(c?.color).toBeDefined();
+    expect(c?.color?.r).toBe(255);
   });
 });
