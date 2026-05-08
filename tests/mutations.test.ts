@@ -25,6 +25,10 @@ import {
   setPatternNotes,
   removePatternNote,
   encodeNote,
+  addPatternController,
+  setPatternControllers,
+  removePatternController,
+  encodeController,
   MutationError,
 } from "../src/mutations/index.ts";
 import { buildArrangements } from "../src/parser/project-builder.ts";
@@ -895,5 +899,233 @@ describe("removePatternNote", () => {
     const beforeCount = project.patterns.find((p) => p.id === 1)!.notes.length;
     removePatternNote(project, 1, 0);
     expect(project.patterns.find((p) => p.id === 1)!.notes.length).toBe(beforeCount);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F2.2 — Pattern controllers (0xDF)                                            //
+// --------------------------------------------------------------------------- //
+
+function ctrl(opts: {
+  position: number;
+  channel: number;
+  value: number;
+  flags?: number;
+}) {
+  return {
+    position: opts.position,
+    channel: opts.channel,
+    value: opts.value,
+    flags: opts.flags ?? 0,
+  };
+}
+
+describe("encodeController — pure record encoder", () => {
+  test("encodes a 12-byte record byte-exact (round-trip via decodeControllers)", () => {
+    const c = ctrl({ position: 96, channel: 3, value: 0.5, flags: 0 });
+    const blob = encodeController(c);
+    expect(blob.byteLength).toBe(12);
+
+    // Two-record blob to make sure the encoder is offset-friendly.
+    const doubled = new Uint8Array(24);
+    doubled.set(blob, 0);
+    doubled.set(blob, 12);
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { decodeControllers } = require("../src/model/pattern.ts") as {
+      decodeControllers: (p: Uint8Array) => unknown[];
+    };
+    const decoded = decodeControllers(doubled) as Array<{
+      position: number;
+      channel: number;
+      value: number;
+      flags: number;
+    }>;
+    expect(decoded.length).toBe(2);
+    for (const d of decoded) {
+      expect(d.position).toBe(96);
+      expect(d.channel).toBe(3);
+      expect(d.flags).toBe(0);
+      // Float32 round-trip: 0.5 is exact.
+      expect(d.value).toBe(0.5);
+    }
+  });
+
+  test("preserves arbitrary float32 value (within float32 precision)", () => {
+    const c = ctrl({ position: 0, channel: 0, value: 0.123456 });
+    const blob = encodeController(c);
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { decodeControllers } = require("../src/model/pattern.ts") as {
+      decodeControllers: (p: Uint8Array) => unknown[];
+    };
+    const decoded = decodeControllers(blob) as Array<{ value: number }>;
+    expect(Math.abs(decoded[0]!.value - 0.123456)).toBeLessThan(1e-6);
+  });
+
+  test("rejects negative position or out-of-u32 range", () => {
+    expect(() => encodeController(ctrl({ position: -1, channel: 0, value: 0.5 }))).toThrow(
+      MutationError,
+    );
+    expect(() =>
+      encodeController(ctrl({ position: 0xffffffff + 1, channel: 0, value: 0.5 })),
+    ).toThrow(MutationError);
+  });
+
+  test("rejects out-of-u8 channel", () => {
+    expect(() => encodeController(ctrl({ position: 0, channel: -1, value: 0.5 }))).toThrow(
+      MutationError,
+    );
+    expect(() => encodeController(ctrl({ position: 0, channel: 256, value: 0.5 }))).toThrow(
+      MutationError,
+    );
+  });
+
+  test("rejects non-finite value", () => {
+    expect(() => encodeController(ctrl({ position: 0, channel: 0, value: NaN }))).toThrow(
+      MutationError,
+    );
+    expect(() =>
+      encodeController(ctrl({ position: 0, channel: 0, value: Infinity })),
+    ).toThrow(MutationError);
+  });
+});
+
+describe("addPatternController", () => {
+  test("appends a controller to an existing pattern (round-trip via serialize)", () => {
+    const project = loadProject(FIXTURE);
+    const before = project.patterns.find((p) => p.id === 1);
+    const baselineCount = before!.controllers.length;
+
+    const newCtrl = ctrl({ position: 96, channel: 1, value: 0.75, flags: 0 });
+    const mutated = addPatternController(project, 1, newCtrl);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.controllers.length).toBe(baselineCount + 1);
+    const last = pattern.controllers[pattern.controllers.length - 1]!;
+    expect(last.position).toBe(96);
+    expect(last.channel).toBe(1);
+    expect(last.value).toBe(0.75);
+  });
+
+  test("EVENT_NOT_FOUND when pattern id doesn't exist", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => addPatternController(project, 999, ctrl({ position: 0, channel: 0, value: 0 }))).toThrow(
+      MutationError,
+    );
+  });
+
+  test("rejects pattern id < 1", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => addPatternController(project, 0, ctrl({ position: 0, channel: 0, value: 0 }))).toThrow(
+      MutationError,
+    );
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.patterns.find((p) => p.id === 1)!.controllers.length;
+    addPatternController(project, 1, ctrl({ position: 0, channel: 0, value: 0.5 }));
+    expect(project.patterns.find((p) => p.id === 1)!.controllers.length).toBe(beforeCount);
+  });
+});
+
+describe("setPatternControllers", () => {
+  test("replaces all controllers on a pattern (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    const replacement = [
+      ctrl({ position: 0, channel: 1, value: 0.0 }),
+      ctrl({ position: 96, channel: 1, value: 0.5 }),
+      ctrl({ position: 192, channel: 1, value: 1.0 }),
+    ];
+    const mutated = setPatternControllers(project, 1, replacement);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.controllers.length).toBe(3);
+    const positions = pattern.controllers.map((c) => c.position).sort((a, b) => a - b);
+    expect(positions).toEqual([0, 96, 192]);
+    const values = pattern.controllers.map((c) => c.value).sort((a, b) => a - b);
+    expect(values).toEqual([0.0, 0.5, 1.0]);
+  });
+
+  test("clearing controllers (empty array) drops all 0xDF events", () => {
+    const project = loadProject(FIXTURE);
+    // Seed something then clear.
+    const seeded = setPatternControllers(project, 1, [
+      ctrl({ position: 0, channel: 1, value: 0.5 }),
+    ]);
+    const cleared = setPatternControllers(seeded, 1, []);
+    const reparsed = reparse(cleared);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+    expect(pattern.controllers.length).toBe(0);
+  });
+
+  test("EVENT_NOT_FOUND on unknown pattern", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => setPatternControllers(project, 999, [])).toThrow(MutationError);
+  });
+
+  test("source project not mutated", () => {
+    const project = loadProject(FIXTURE);
+    const beforeCount = project.patterns.find((p) => p.id === 1)!.controllers.length;
+    setPatternControllers(project, 1, [ctrl({ position: 0, channel: 0, value: 0.5 })]);
+    expect(project.patterns.find((p) => p.id === 1)!.controllers.length).toBe(beforeCount);
+  });
+
+  test("notes on the pattern are not disturbed by controller mutations", () => {
+    const project = loadProject(FIXTURE);
+    const noteCountBefore = project.patterns.find((p) => p.id === 1)!.notes.length;
+    const mutated = setPatternControllers(project, 1, [
+      ctrl({ position: 0, channel: 1, value: 0.5 }),
+    ]);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+    expect(pattern.notes.length).toBe(noteCountBefore);
+    expect(pattern.controllers.length).toBe(1);
+  });
+});
+
+describe("removePatternController", () => {
+  test("removes by index (round-trip)", () => {
+    const project = loadProject(FIXTURE);
+    const seeded = setPatternControllers(project, 1, [
+      ctrl({ position: 0, channel: 1, value: 0.0 }),
+      ctrl({ position: 96, channel: 1, value: 0.5 }),
+      ctrl({ position: 192, channel: 1, value: 1.0 }),
+    ]);
+    const mutated = removePatternController(seeded, 1, 1);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.controllers.length).toBe(2);
+    const positions = pattern.controllers.map((c) => c.position).sort((a, b) => a - b);
+    expect(positions).toEqual([0, 192]);
+  });
+
+  test("removes by predicate (channel == 2)", () => {
+    const project = loadProject(FIXTURE);
+    const seeded = setPatternControllers(project, 1, [
+      ctrl({ position: 0, channel: 1, value: 0.5 }),
+      ctrl({ position: 96, channel: 2, value: 0.5 }),
+      ctrl({ position: 192, channel: 2, value: 0.5 }),
+      ctrl({ position: 288, channel: 1, value: 0.5 }),
+    ]);
+    const mutated = removePatternController(seeded, 1, (c) => c.channel === 2);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+
+    expect(pattern.controllers.length).toBe(2);
+    expect(pattern.controllers.every((c) => c.channel === 1)).toBe(true);
+  });
+
+  test("rejects out-of-range index", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => removePatternController(project, 1, -1)).toThrow(MutationError);
+    expect(() => removePatternController(project, 1, 9999)).toThrow(MutationError);
+  });
+
+  test("EVENT_NOT_FOUND on unknown pattern id", () => {
+    const project = loadProject(FIXTURE);
+    expect(() => removePatternController(project, 999, 0)).toThrow(MutationError);
   });
 });

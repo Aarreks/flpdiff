@@ -61,12 +61,15 @@ import {
   addPatternNote,
   setPatternNotes,
   removePatternNote,
+  addPatternController,
+  setPatternControllers,
+  removePatternController,
   MutationError,
   type RGBA,
   type ClipPlacement,
   type ClipMatch,
 } from "./mutations/index.ts";
-import type { Note } from "./model/pattern.ts";
+import type { Controller, Note } from "./model/pattern.ts";
 import { planReorganize, reorganizeProject } from "./reorganize/index.ts";
 
 type BridgeRequest = {
@@ -123,6 +126,9 @@ const WRITE_KINDS = new Set([
   "add_pattern_note",
   "set_pattern_notes",
   "remove_pattern_note",
+  "add_pattern_controller",
+  "set_pattern_controllers",
+  "remove_pattern_controller",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -225,6 +231,33 @@ function parseNoteArgs(args: Record<string, unknown>): Note {
   };
 }
 
+/**
+ * Build a `Controller` from flat bridge args. Required: position,
+ * channel, value. Optional: flags (default 0).
+ */
+function parseControllerArgs(args: Record<string, unknown>): Controller {
+  const num = (k: string, required: boolean, def?: number): number => {
+    const raw = args[k];
+    if (raw === undefined || raw === null) {
+      if (required) {
+        throw new MutationError("INVALID_ARGS", `args.${k} is required (number)`);
+      }
+      return def!;
+    }
+    const v = Number(raw);
+    if (!Number.isFinite(v)) {
+      throw new MutationError("INVALID_ARGS", `args.${k} must be a finite number, got ${raw}`);
+    }
+    return v;
+  };
+  return {
+    position: num("position", true),
+    channel: num("channel", true),
+    value: num("value", true),
+    flags: num("flags", false, 0),
+  };
+}
+
 function parseRGBAArg(args: Record<string, unknown>): RGBA {
   const c = args["color"];
   if (!c || typeof c !== "object") {
@@ -324,6 +357,16 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   ]),
   set_pattern_notes: new Set(["path", "pattern_id", "notes"]),
   remove_pattern_note: new Set(["path", "pattern_id", "index"]),
+  add_pattern_controller: new Set([
+    "path",
+    "pattern_id",
+    "position",
+    "channel",
+    "value",
+    "flags",
+  ]),
+  set_pattern_controllers: new Set(["path", "pattern_id", "controllers"]),
+  remove_pattern_controller: new Set(["path", "pattern_id", "index"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -699,6 +742,53 @@ function executeWrite(
         );
       }
       mutated = removePatternNote(project, patternId, index);
+    } else if (kind === "add_pattern_controller") {
+      const patternId = Number(args["pattern_id"]);
+      if (!Number.isFinite(patternId)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.pattern_id is required (positive integer)",
+        );
+      }
+      mutated = addPatternController(project, patternId, parseControllerArgs(args));
+    } else if (kind === "set_pattern_controllers") {
+      const patternId = Number(args["pattern_id"]);
+      if (!Number.isFinite(patternId)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.pattern_id is required (positive integer)",
+        );
+      }
+      const rawCtrls = args["controllers"];
+      if (!Array.isArray(rawCtrls)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.controllers is required (array of controller objects, possibly empty)",
+        );
+      }
+      const ctrls: Controller[] = rawCtrls.map((c, i) => {
+        if (!c || typeof c !== "object") {
+          throw new MutationError("INVALID_ARGS", `args.controllers[${i}] must be an object`);
+        }
+        return parseControllerArgs(c as Record<string, unknown>);
+      });
+      mutated = setPatternControllers(project, patternId, ctrls);
+    } else if (kind === "remove_pattern_controller") {
+      const patternId = Number(args["pattern_id"]);
+      const index = Number(args["index"]);
+      if (!Number.isFinite(patternId)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.pattern_id is required (positive integer)",
+        );
+      }
+      if (!Number.isFinite(index)) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.index is required (non-negative integer)",
+        );
+      }
+      mutated = removePatternController(project, patternId, index);
     } else {
       return {
         ok: false,

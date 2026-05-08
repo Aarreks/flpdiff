@@ -13,7 +13,7 @@
  */
 import type { FLPProject } from "../parser/flp-project.ts";
 import type { FLPEvent } from "../parser/event.ts";
-import { decodeNotes, type Note } from "../model/pattern.ts";
+import { decodeNotes, decodeControllers, type Controller, type Note } from "../model/pattern.ts";
 
 export class MutationError extends Error {
   constructor(
@@ -1687,4 +1687,201 @@ export function removePatternNote(
     kept = existing.filter((n, i) => !selector(n, i));
   }
   return setPatternNotes(project, patternId, kept);
+}
+
+// --------------------------------------------------------------------------- //
+// F2.2 — Pattern controllers encoder (0xDF)                                    //
+// --------------------------------------------------------------------------- //
+
+const CONTROLLER_RECORD_SIZE = 12;
+
+/**
+ * Encode a single `Controller` to its 12-byte on-disk record (opcode
+ * `0xDF` payload format). Inverse of `decodeControllers` in
+ * `model/pattern.ts`.
+ *
+ * Layout (per PyFLP `ControllerEvent.STRUCT` cross-checked against
+ * decoder; cumulative end offsets corrected per D-45):
+ *   bytes 0-3: position (uint32 LE)
+ *   bytes 4-5: reserved (zero — PyFLP `_u1` + `_u2`)
+ *   byte 6:    channel (uint8)
+ *   byte 7:    flags (uint8)
+ *   bytes 8-11: value (float32 LE)
+ */
+export function encodeController(controller: Controller): Uint8Array {
+  if (
+    !Number.isInteger(controller.position) ||
+    controller.position < 0 ||
+    controller.position > 0xffffffff
+  ) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `controller.position must be u32, got ${controller.position}`,
+    );
+  }
+  if (!Number.isInteger(controller.channel) || controller.channel < 0 || controller.channel > 255) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `controller.channel must be u8 (0..255), got ${controller.channel}`,
+    );
+  }
+  if (!Number.isInteger(controller.flags) || controller.flags < 0 || controller.flags > 255) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `controller.flags must be u8 (0..255), got ${controller.flags}`,
+    );
+  }
+  if (!Number.isFinite(controller.value)) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `controller.value must be a finite float, got ${controller.value}`,
+    );
+  }
+
+  const buf = new Uint8Array(CONTROLLER_RECORD_SIZE);
+  const view = new DataView(buf.buffer);
+  view.setUint32(0, controller.position, true);
+  // bytes 4-5 reserved (left as 0)
+  buf[6] = controller.channel & 0xff;
+  buf[7] = controller.flags & 0xff;
+  view.setFloat32(8, controller.value, true);
+  return buf;
+}
+
+function encodePatternControllers(controllers: readonly Controller[]): Uint8Array {
+  const out = new Uint8Array(controllers.length * CONTROLLER_RECORD_SIZE);
+  for (let i = 0; i < controllers.length; i++) {
+    out.set(encodeController(controllers[i]!), i * CONTROLLER_RECORD_SIZE);
+  }
+  return out;
+}
+
+function collectExistingControllers(
+  events: readonly FLPEvent[],
+  scope: { startIdx: number; endIdx: number },
+): Controller[] {
+  const out: Controller[] = [];
+  for (let i = scope.startIdx + 1; i < scope.endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_PATTERN_CONTROLLERS) {
+      for (const c of decodeControllers(ev.payload)) out.push(c);
+    }
+  }
+  return out;
+}
+
+/**
+ * Replace every controller record on `patternId` with `controllers`.
+ * All existing `0xDF` events inside the pattern's scope are dropped;
+ * if `controllers` is non-empty a single concatenated `0xDF` is
+ * inserted right after the pattern's `0xC1` name (or after `0x41` if
+ * no name exists). Mirrors the `setPatternNotes` shape.
+ *
+ * Throws `EVENT_NOT_FOUND` for unknown pattern, `INVALID_ARGS` for
+ * non-positive `patternId` or invalid controller fields.
+ */
+export function setPatternControllers(
+  project: FLPProject,
+  patternId: number,
+  controllers: readonly Controller[],
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+
+  const encoded = controllers.length > 0 ? encodePatternControllers(controllers) : null;
+
+  const events: FLPEvent[] = [];
+  for (let i = 0; i < project.events.length; i++) {
+    const ev = project.events[i]!;
+    if (i > scope.startIdx && i < scope.endIdx && ev.opcode === OP_PATTERN_CONTROLLERS) continue;
+    events.push(ev);
+  }
+
+  if (encoded === null) return { ...project, events };
+
+  const newScope = findPatternScope(events, patternId)!;
+  let insertAt = newScope.startIdx + 1;
+  for (let i = newScope.startIdx + 1; i < newScope.endIdx; i++) {
+    if (events[i]!.opcode === OP_PATTERN_NAME) {
+      insertAt = i + 1;
+      break;
+    }
+  }
+  events.splice(insertAt, 0, {
+    kind: "blob",
+    opcode: OP_PATTERN_CONTROLLERS,
+    payload: encoded,
+  });
+  return { ...project, events };
+}
+
+/**
+ * Append one controller event to a pattern. Existing controllers are
+ * preserved; the rewritten payload coalesces every controller into a
+ * single `0xDF` blob (FL emits one but reads concatenations).
+ */
+export function addPatternController(
+  project: FLPProject,
+  patternId: number,
+  controller: Controller,
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  encodeController(controller);
+  const existing = collectExistingControllers(project.events, scope);
+  return setPatternControllers(project, patternId, [...existing, controller]);
+}
+
+/**
+ * Remove a controller from a pattern. `selector` is either a 0-based
+ * index into the existing controller list or a predicate
+ * `(controller, index) => boolean` that returns true for every
+ * controller to drop.
+ */
+export function removePatternController(
+  project: FLPProject,
+  patternId: number,
+  selector: number | ((controller: Controller, index: number) => boolean),
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingControllers(project.events, scope);
+
+  let kept: Controller[];
+  if (typeof selector === "number") {
+    if (!Number.isInteger(selector) || selector < 0 || selector >= existing.length) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `controller index ${selector} out of range [0, ${existing.length})`,
+      );
+    }
+    kept = existing.filter((_, i) => i !== selector);
+  } else {
+    kept = existing.filter((c, i) => !selector(c, i));
+  }
+  return setPatternControllers(project, patternId, kept);
 }
