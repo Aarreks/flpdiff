@@ -2071,9 +2071,20 @@ const OP_PLUGIN_NAME_IN_MIXER_SCOPE = OP_NAME; // 0xCB - in mixer-slot scope, th
  */
 export type EQ2BandField = "level" | "freq" | "width";
 
+/**
+ * Generic param reference: an integer parameter index. Maps directly
+ * to FL's `plugins.setParamValue(value, paramIndex, ...)` numbering.
+ * The plugin's layout entry tells the encoder which byte offset that
+ * index targets and which field type to write.
+ *
+ * EQ 2 also accepts the structured `main_level` / `band` refs; new
+ * plugin layouts authored via the auto-sweep tool emit generic
+ * `{kind:"param", index}` only.
+ */
 export type PluginParamRef =
   | { kind: "main_level" }
-  | { kind: "band"; band: number; field: EQ2BandField };
+  | { kind: "band"; band: number; field: EQ2BandField }
+  | { kind: "param"; index: number };
 
 export type PluginScope =
   | { kind: "channel"; channelIid: number }
@@ -2094,7 +2105,7 @@ type PluginLayout = {
   maxSize: number;
   paramRefToOffset: (
     ref: PluginParamRef,
-  ) => { offset: number; fieldType: "u16" } | null;
+  ) => { offset: number; fieldType: "u8" | "u16" } | null;
 };
 
 const EQ2_LAYOUT: PluginLayout = {
@@ -2337,6 +2348,9 @@ export function setNativePluginParam(
     const raw = Math.round(normalizedValue * 0xffff);
     newPayload[offsetInfo.offset] = raw & 0xff;
     newPayload[offsetInfo.offset + 1] = (raw >> 8) & 0xff;
+  } else if (offsetInfo.fieldType === "u8") {
+    const raw = Math.round(normalizedValue * 0xff);
+    newPayload[offsetInfo.offset] = raw & 0xff;
   }
 
   const events = [...project.events];

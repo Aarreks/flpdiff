@@ -387,6 +387,7 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "param",
     "band",
     "field",
+    "param_index",
     "value",
   ]),
 };
@@ -857,7 +858,7 @@ function executeWrite(
         );
       }
 
-      // param = "main_level" or band field; band fields use args.band + args.field
+      // param = "main_level" | "band" | "param" (generic index)
       let param: PluginParamRef;
       const paramKind = args["param"];
       if (paramKind === "main_level") {
@@ -878,10 +879,19 @@ function executeWrite(
           );
         }
         param = { kind: "band", band, field };
+      } else if (paramKind === "param") {
+        const idx = Number(args["param_index"]);
+        if (!Number.isInteger(idx) || idx < 0) {
+          throw new MutationError(
+            "INVALID_ARGS",
+            "args.param_index required (non-negative integer) when param='param'",
+          );
+        }
+        param = { kind: "param", index: idx };
       } else {
         throw new MutationError(
           "INVALID_ARGS",
-          "args.param must be 'main_level' or 'band'",
+          "args.param must be 'main_level' | 'band' | 'param'",
         );
       }
 
