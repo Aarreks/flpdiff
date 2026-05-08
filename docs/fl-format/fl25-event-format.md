@@ -489,6 +489,31 @@ intentionally does NOT bump this field; the new `0x40` event alone is
 sufficient for FL to surface the new channel in the rack. (Decision
 D-53.)
 
+## `0xD5` Fruity Parametric EQ 2 — encoder-side patch points
+
+The blob's parameter region is layout-stable across FL 25.x:
+
+| Offset (hex) | Field | Type | Notes |
+|-------------:|-------|------|-------|
+| `0x00..0x03` | header | 4 bytes | not yet decoded |
+| `0x04..0x1f` | Band 1..7 **level** | 7 × `u16 LE` (4-byte slot stride) | normalized = `raw / 0xFFFF` |
+| `0x20..0x3b` | Band 1..7 **freq** | 7 × `u16 LE` | |
+| `0x3c..0x57` | Band 1..7 **width** | 7 × `u16 LE` | |
+| `0x58..0x73` | Band 1..7 **type** | 7 × `u8` enum (0..7) | encoder skips (lossy 0..1 mapping) |
+| `0x74..0x8f` | Band 1..7 **order** | 7 × `u8` enum | encoder skips |
+| `0x90..0x91` | **Main level** | `u16 LE` | |
+| `0x92..end`  | trailing opaque state | varies | FL 25.2.4 = 354 bytes total; older saves = 350 |
+
+`setNativePluginParam` only writes the uint16 LE slots (level / freq
+/ width / main_level). The encoder validates the blob size is in
+`[0x92, 500]` to tolerate FL save-version drift while still rejecting
+unrelated blobs at the same scope.
+
+**VST plugins (Fruity Wrapper-hosted)** also live under `0xD5` but
+their payload contains session-internal noise that drifts across
+same-value saves. Fixed-offset RE doesn't translate; encoders refuse
+unregistered plugin names with `UNSUPPORTED_PLUGIN`. (Decision D-54.)
+
 ## Changelog
 
 - **2026-04-16** — Initial version. Tempo at bytes 155-158 as
