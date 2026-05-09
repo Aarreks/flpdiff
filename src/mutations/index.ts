@@ -2798,3 +2798,120 @@ export function invertPatternNotes(
 }
 
 void OP_PATTERN_NEW_FOR_LEN;
+
+// --------------------------------------------------------------------------- //
+// F6.2 — Channel volume + pan (0xDB Levels blob)                              //
+// --------------------------------------------------------------------------- //
+//
+// Per-channel volume + pan live in a 24-byte 0xDB blob (FL 25), one
+// per channel. Layout (decoded by `decodeLevels` in
+// src/model/channel.ts):
+//   offset 0  int32   pan          (-6400 .. +6400, 0 = center)
+//   offset 4  uint32  volume       (0 .. 12800, 10000 = default 0.78)
+//   offset 8  int32   pitch_shift
+//   offset 12 uint32  filter_mod_x
+//   offset 16 uint32  filter_mod_y
+//   offset 20 uint32  filter_type
+//
+// Encoders preserve fields 8..23 verbatim; only patch offsets 0/4.
+
+const OP_CHANNEL_LEVELS = 0xdb;
+const CHANNEL_VOLUME_MAX = 12800;
+const CHANNEL_PAN_MAX = 6400;
+
+/** Find the 0xDB blob event index for a given channel iid. Walks the
+ *  channel scope between consecutive `0x40 NEW_CHANNEL` markers. */
+function findChannelLevelsEvent(
+  events: readonly FLPEvent[],
+  iid: number,
+): number {
+  let inScope = false;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) {
+      inScope = ev.value === iid;
+      continue;
+    }
+    if (!inScope) continue;
+    if (ev.kind === "blob" && ev.opcode === OP_CHANNEL_LEVELS) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** Patch one numeric field inside the 24-byte 0xDB Levels blob.
+ *  Throws if no Levels event exists for the channel (FL emits one
+ *  for every channel, so absence means the FLP is malformed or the
+ *  iid doesn't exist). */
+function patchChannelLevels(
+  project: FLPProject,
+  iid: number,
+  patch: (view: DataView) => void,
+): FLPProject {
+  if (!Number.isInteger(iid) || iid < 0) {
+    throw new MutationError("INVALID_ARGS", `channel iid must be a non-negative integer, got ${iid}`);
+  }
+  const eventIdx = findChannelLevelsEvent(project.events, iid);
+  if (eventIdx < 0) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `no 0xDB Levels event found for channel iid=${iid}`,
+    );
+  }
+  const ev = project.events[eventIdx]!;
+  if (ev.kind !== "blob" || ev.payload.byteLength < 24) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `0xDB event for channel ${iid} is not a 24+ byte blob`,
+    );
+  }
+  const newPayload = new Uint8Array(ev.payload);
+  const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+  patch(view);
+  const events = [...project.events];
+  events[eventIdx] = { kind: "blob", opcode: OP_CHANNEL_LEVELS, payload: newPayload };
+  return { ...project, events };
+}
+
+/**
+ * Set a channel's volume (offset 4, uint32 LE). `normalized` is in
+ * `[0, 1]` and maps linearly to `[0, 12800]`. FL's "default 0.78"
+ * = `0.78125 = 10000/12800`.
+ */
+export function setChannelVolume(
+  project: FLPProject,
+  iid: number,
+  normalized: number,
+): FLPProject {
+  if (!Number.isFinite(normalized) || normalized < 0 || normalized > 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `volume must be in [0, 1], got ${normalized}`,
+    );
+  }
+  return patchChannelLevels(project, iid, (view) => {
+    view.setUint32(4, Math.round(normalized * CHANNEL_VOLUME_MAX), true);
+  });
+}
+
+/**
+ * Set a channel's pan (offset 0, int32 LE). `normalized` is in
+ * `[-1, +1]` (bipolar): -1 = full left, 0 = center, +1 = full right.
+ * Maps to `[-6400, +6400]`.
+ */
+export function setChannelPan(
+  project: FLPProject,
+  iid: number,
+  normalized: number,
+): FLPProject {
+  if (!Number.isFinite(normalized) || normalized < -1 || normalized > 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pan must be in [-1, +1], got ${normalized}`,
+    );
+  }
+  return patchChannelLevels(project, iid, (view) => {
+    view.setInt32(0, Math.round(normalized * CHANNEL_PAN_MAX), true);
+  });
+}

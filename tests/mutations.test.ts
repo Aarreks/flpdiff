@@ -39,6 +39,8 @@ import {
   humanizeTimings,
   reversePatternNotes,
   invertPatternNotes,
+  setChannelVolume,
+  setChannelPan,
   MutationError,
 } from "../src/mutations/index.ts";
 import type { FLPProject } from "../src/parser/flp-project.ts";
@@ -1954,5 +1956,73 @@ describe("invertPatternNotes", () => {
   test("rejects axisKey out of range", () => {
     expect(() => invertPatternNotes(loadProject(FIXTURE), 1, -1)).toThrow(MutationError);
     expect(() => invertPatternNotes(loadProject(FIXTURE), 1, 200)).toThrow(MutationError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F6.2 — Channel volume + pan (0xDB Levels blob)                              //
+// --------------------------------------------------------------------------- //
+
+function readChannelLevels(project: FLPProject, iid: number): { vol: number; pan: number } {
+  const reparsed = reparse(project);
+  const ch = reparsed.channels.find((c) => c.iid === iid);
+  if (!ch?.levels) throw new Error(`channel ${iid} has no levels`);
+  return { vol: ch.levels.volume, pan: ch.levels.pan };
+}
+
+describe("setChannelVolume", () => {
+  test("0.5 normalized -> 6400 raw (0.5 * 12800)", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setChannelVolume(project, 1, 0.5);
+    expect(readChannelLevels(mutated, 1).vol).toBe(6400);
+  });
+
+  test("0.0 -> 0; 1.0 -> 12800 (boundaries)", () => {
+    const project = loadProject(FIXTURE);
+    expect(readChannelLevels(setChannelVolume(project, 1, 0), 1).vol).toBe(0);
+    expect(readChannelLevels(setChannelVolume(project, 1, 1), 1).vol).toBe(12800);
+  });
+
+  test("preserves pan + other levels fields", () => {
+    const project = loadProject(FIXTURE);
+    const before = readChannelLevels(project, 1);
+    const mutated = setChannelVolume(project, 1, 0.3);
+    const after = readChannelLevels(mutated, 1);
+    expect(after.pan).toBe(before.pan);
+  });
+
+  test("rejects out-of-range value", () => {
+    expect(() => setChannelVolume(loadProject(FIXTURE), 1, -0.1)).toThrow(MutationError);
+    expect(() => setChannelVolume(loadProject(FIXTURE), 1, 1.5)).toThrow(MutationError);
+  });
+
+  test("rejects unknown channel iid", () => {
+    expect(() => setChannelVolume(loadProject(FIXTURE), 999, 0.5)).toThrow(MutationError);
+  });
+});
+
+describe("setChannelPan", () => {
+  test("center (0.0) -> 0 raw", () => {
+    const project = loadProject(FIXTURE);
+    expect(readChannelLevels(setChannelPan(project, 1, 0), 1).pan).toBe(0);
+  });
+
+  test("full left (-1.0) -> -6400; full right (+1.0) -> +6400", () => {
+    const project = loadProject(FIXTURE);
+    expect(readChannelLevels(setChannelPan(project, 1, -1), 1).pan).toBe(-6400);
+    expect(readChannelLevels(setChannelPan(project, 1, +1), 1).pan).toBe(6400);
+  });
+
+  test("preserves volume", () => {
+    const project = loadProject(FIXTURE);
+    const before = readChannelLevels(project, 1);
+    const mutated = setChannelPan(project, 1, 0.5);
+    expect(readChannelLevels(mutated, 1).vol).toBe(before.vol);
+  });
+
+  test("rejects out-of-range value", () => {
+    expect(() => setChannelPan(loadProject(FIXTURE), 1, -1.1)).toThrow(MutationError);
+    expect(() => setChannelPan(loadProject(FIXTURE), 1, 1.1)).toThrow(MutationError);
+    expect(() => setChannelPan(loadProject(FIXTURE), 1, NaN)).toThrow(MutationError);
   });
 });

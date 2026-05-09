@@ -77,6 +77,8 @@ import {
   humanizeTimings,
   reversePatternNotes,
   invertPatternNotes,
+  setChannelVolume,
+  setChannelPan,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -153,6 +155,9 @@ const WRITE_KINDS = new Set([
   "humanize_timings",
   "reverse_pattern_notes",
   "invert_pattern_notes",
+  // Epic 6 / F6.2 — channel volume + pan
+  "set_channel_volume",
+  "set_channel_pan",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -413,6 +418,9 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   humanize_timings: new Set(["path", "pattern_id", "range_ticks", "seed"]),
   reverse_pattern_notes: new Set(["path", "pattern_id"]),
   invert_pattern_notes: new Set(["path", "pattern_id", "axis_key"]),
+  // Epic 6 / F6.2
+  set_channel_volume: new Set(["path", "iid", "value"]),
+  set_channel_pan: new Set(["path", "iid", "value"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -978,6 +986,20 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "pattern_id required (integer)");
       }
       mutated = invertPatternNotes(project, pid, axis);
+    } else if (kind === "set_channel_volume") {
+      const iid = Number(args["iid"]);
+      const value = Number(args["value"]);
+      if (!Number.isInteger(iid) || !Number.isFinite(value)) {
+        throw new MutationError("INVALID_ARGS", "iid (int) + value (0..1) required");
+      }
+      mutated = setChannelVolume(project, iid, value);
+    } else if (kind === "set_channel_pan") {
+      const iid = Number(args["iid"]);
+      const value = Number(args["value"]);
+      if (!Number.isInteger(iid) || !Number.isFinite(value)) {
+        throw new MutationError("INVALID_ARGS", "iid (int) + value (-1..+1) required");
+      }
+      mutated = setChannelPan(project, iid, value);
     } else if (kind === "create_channel") {
       const name = args["name"];
       const kindArg = args["kind"];
