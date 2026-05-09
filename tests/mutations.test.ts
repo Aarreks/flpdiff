@@ -41,6 +41,7 @@ import {
   invertPatternNotes,
   setChannelVolume,
   setChannelPan,
+  arrangeSong,
   MutationError,
 } from "../src/mutations/index.ts";
 import type { FLPProject } from "../src/parser/flp-project.ts";
@@ -2024,5 +2025,94 @@ describe("setChannelPan", () => {
     expect(() => setChannelPan(loadProject(FIXTURE), 1, -1.1)).toThrow(MutationError);
     expect(() => setChannelPan(loadProject(FIXTURE), 1, 1.1)).toThrow(MutationError);
     expect(() => setChannelPan(loadProject(FIXTURE), 1, NaN)).toThrow(MutationError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F6.5 — arrangeSong (composite over addClip)                                 //
+// --------------------------------------------------------------------------- //
+
+describe("arrangeSong", () => {
+  test("lays 3 sections sequentially (4 bars each, PPQ=96, 4/4)", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = arrangeSong(project, 0, [
+      { pattern_id: 1, bars: 4 },
+      { pattern_id: 1, bars: 4 },
+      { pattern_id: 1, bars: 4 },
+    ]);
+    const reparsed = reparse(mutated);
+    const arr = buildArrangements(
+      reparsed.events,
+      reparsed.channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    )[0]!;
+    expect(arr.clips.length).toBeGreaterThanOrEqual(3);
+    // Sections at 0, 1536, 3072 (4 bars * 4 beats * 96 ppq = 1536 ticks each).
+    const positions = arr.clips
+      .filter((c) => c.item_index >= 20480) // PATTERN_BASE filter
+      .map((c) => c.position)
+      .sort((a, b) => a - b);
+    expect(positions).toContain(0);
+    expect(positions).toContain(1536);
+    expect(positions).toContain(3072);
+  });
+
+  test("respects explicit position_ticks override", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = arrangeSong(project, 0, [
+      { pattern_id: 1, bars: 2, position_ticks: 768 },
+    ]);
+    const reparsed = reparse(mutated);
+    const arr = buildArrangements(
+      reparsed.events,
+      reparsed.channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    )[0]!;
+    const positions = arr.clips
+      .filter((c) => c.item_index >= 20480)
+      .map((c) => c.position);
+    expect(positions).toContain(768);
+  });
+
+  test("rejects empty structure", () => {
+    expect(() => arrangeSong(loadProject(FIXTURE), 0, [])).toThrow(MutationError);
+  });
+
+  test("rejects bad section data", () => {
+    expect(() =>
+      arrangeSong(loadProject(FIXTURE), 0, [{ pattern_id: 0, bars: 4 }]),
+    ).toThrow(MutationError);
+    expect(() =>
+      arrangeSong(loadProject(FIXTURE), 0, [{ pattern_id: 1, bars: 0 }]),
+    ).toThrow(MutationError);
+  });
+
+  test("custom beats_per_bar (3/4 → 3 beats per bar)", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = arrangeSong(
+      project,
+      0,
+      [
+        { pattern_id: 1, bars: 2 },
+        { pattern_id: 1, bars: 2 },
+      ],
+      { beats_per_bar: 3 },
+    );
+    const reparsed = reparse(mutated);
+    const arr = buildArrangements(
+      reparsed.events,
+      reparsed.channels,
+      reparsed.patterns,
+      reparsed.metadata,
+    )[0]!;
+    // Section 1 at 0; section 2 at 2*3*96 = 576 ticks (not 768).
+    const positions = arr.clips
+      .filter((c) => c.item_index >= 20480)
+      .map((c) => c.position)
+      .sort((a, b) => a - b);
+    expect(positions).toContain(0);
+    expect(positions).toContain(576);
   });
 });

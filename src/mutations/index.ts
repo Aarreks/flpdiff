@@ -2915,3 +2915,92 @@ export function setChannelPan(
     view.setInt32(0, Math.round(normalized * CHANNEL_PAN_MAX), true);
   });
 }
+
+// --------------------------------------------------------------------------- //
+// F6.5 — Arrangement sequencing (composite helper over addClip)               //
+// --------------------------------------------------------------------------- //
+//
+// `arrangeSong` lays out a sequence of pattern clips in a single
+// arrangement, computing playlist positions from a structure spec.
+// Internally calls `addClip` per section.
+
+export type SongSection = {
+  /** Pattern id to place (must already exist). */
+  pattern_id: number;
+  /** Length of this section in bars (4 beats per bar at 4/4). */
+  bars: number;
+  /** Optional explicit position in PPQ ticks. If omitted, sections
+   *  are laid sequentially starting at 0 (or after the previous one). */
+  position_ticks?: number;
+};
+
+export type ArrangeSongOptions = {
+  /** Track index (0-based, top track) where the clips land.
+   *  Default: 0. Sections stack horizontally on this track. */
+  track_index?: number;
+  /** Number of beats per bar. Default 4 (assumes 4/4). */
+  beats_per_bar?: number;
+};
+
+/**
+ * Lay out a sequence of pattern clips on a single track of the
+ * arrangement. Computes positions sequentially from `bars * ppq *
+ * beats_per_bar` unless a section overrides `position_ticks`.
+ *
+ * Returns the mutated project with N new playlist clips appended
+ * (one per section in `structure`).
+ *
+ * Throws `INVALID_ARGS` if structure is empty / contains bad data;
+ * `EVENT_NOT_FOUND` if the arrangement_id doesn't exist (from
+ * underlying `addClip`).
+ */
+export function arrangeSong(
+  project: FLPProject,
+  arrangementId: number,
+  structure: readonly SongSection[],
+  opts: ArrangeSongOptions = {},
+): FLPProject {
+  if (!Array.isArray(structure) || structure.length === 0) {
+    throw new MutationError("INVALID_ARGS", "structure must be a non-empty array of sections");
+  }
+  const trackIndex = opts.track_index ?? 0;
+  const beatsPerBar = opts.beats_per_bar ?? 4;
+  if (!Number.isInteger(beatsPerBar) || beatsPerBar < 1) {
+    throw new MutationError("INVALID_ARGS", `beats_per_bar must be positive integer, got ${beatsPerBar}`);
+  }
+  const ppq = project.header.ppq;
+  let cursor = 0;
+  let next = project;
+  for (let i = 0; i < structure.length; i++) {
+    const section = structure[i]!;
+    if (!Number.isInteger(section.pattern_id) || section.pattern_id < 1) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `structure[${i}].pattern_id must be positive integer, got ${section.pattern_id}`,
+      );
+    }
+    if (!Number.isInteger(section.bars) || section.bars < 1) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `structure[${i}].bars must be positive integer, got ${section.bars}`,
+      );
+    }
+    const lengthTicks = section.bars * beatsPerBar * ppq;
+    const positionTicks = section.position_ticks ?? cursor;
+    if (!Number.isInteger(positionTicks) || positionTicks < 0) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `structure[${i}].position_ticks must be non-negative integer, got ${positionTicks}`,
+      );
+    }
+    next = addClip(next, arrangementId, {
+      kind: "pattern",
+      ref_id: section.pattern_id,
+      track_index: trackIndex,
+      position_ticks: positionTicks,
+      length_ticks: lengthTicks,
+    });
+    cursor = positionTicks + lengthTicks;
+  }
+  return next;
+}

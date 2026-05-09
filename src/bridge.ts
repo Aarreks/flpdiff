@@ -79,6 +79,8 @@ import {
   invertPatternNotes,
   setChannelVolume,
   setChannelPan,
+  arrangeSong,
+  type SongSection,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -163,6 +165,8 @@ const WRITE_KINDS = new Set([
   // Epic 6 / F6.2 — channel volume + pan
   "set_channel_volume",
   "set_channel_pan",
+  // Epic 6 / F6.5 — arrangement sequencing
+  "arrange_song",
 ]);
 
 /**
@@ -441,6 +445,7 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   // Epic 6 / F6.2
   set_channel_volume: new Set(["path", "iid", "value"]),
   set_channel_pan: new Set(["path", "iid", "value"]),
+  arrange_song: new Set(["path", "arrangement", "structure", "track_index", "beats_per_bar"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -1020,6 +1025,34 @@ function executeWrite(
         throw new MutationError("INVALID_ARGS", "iid (int) + value (-1..+1) required");
       }
       mutated = setChannelPan(project, iid, value);
+    } else if (kind === "arrange_song") {
+      const arrangement = Number(args["arrangement"] ?? 0);
+      const rawStruct = args["structure"];
+      if (!Array.isArray(rawStruct)) {
+        throw new MutationError("INVALID_ARGS", "args.structure must be an array");
+      }
+      const structure: SongSection[] = rawStruct.map((s, i) => {
+        const obj = s as Record<string, unknown>;
+        const pid = Number(obj["pattern_id"]);
+        const bars = Number(obj["bars"]);
+        if (!Number.isInteger(pid) || !Number.isInteger(bars)) {
+          throw new MutationError(
+            "INVALID_ARGS",
+            `structure[${i}].pattern_id + bars required (integers)`,
+          );
+        }
+        const sec: SongSection = { pattern_id: pid, bars };
+        if (obj["position_ticks"] !== undefined) {
+          sec.position_ticks = Number(obj["position_ticks"]);
+        }
+        return sec;
+      });
+      const trackIndex = args["track_index"] === undefined ? 0 : Number(args["track_index"]);
+      const beatsPerBar = args["beats_per_bar"] === undefined ? 4 : Number(args["beats_per_bar"]);
+      mutated = arrangeSong(project, arrangement, structure, {
+        track_index: trackIndex,
+        beats_per_bar: beatsPerBar,
+      });
     } else if (kind === "create_channel") {
       const name = args["name"];
       const kindArg = args["kind"];
