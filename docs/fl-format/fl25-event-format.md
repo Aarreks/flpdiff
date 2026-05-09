@@ -537,6 +537,69 @@ their payload contains session-internal noise that drifts across
 same-value saves. Fixed-offset RE doesn't translate; encoders refuse
 unregistered plugin names with `UNSUPPORTED_PLUGIN`. (Decision D-54.)
 
+## Mixer slot index — file vs FL UI / IPC
+
+A subtle off-by-one between flpdiff's parser and FL's runtime API
+surfaced while RE'ing plugin layouts:
+
+- **flpdiff's parser**: each `0x62 N` (`OP_NEW_SLOT`, u16 value)
+  attributes its scope's events to slot index N.
+- **FL Studio's runtime** (`plugins.getPluginName(insert, slot)`,
+  `plugins.setParamValue(value, param, insert, slot)`): slot index is
+  `0x62 N + 1`. Specifically:
+  - Events BEFORE the first `0x62` of an insert → FL slot 0.
+  - Events between `0x62 (N-1)` and `0x62 N` → FL slot N.
+  - Events between `0x62 N` and `0x62 (N+1)` → FL slot N+1.
+
+So a plugin the file places between `0x62 7` and `0x62 8` is FL
+slot 8, not slot 7. Verified empirically against `junie.flp`'s
+master mixer: file-side `0x62 7 → 0xC9 "Fruity Limiter" → 0x62 8`
+exposes via IPC as `getPluginName(0, 8) → "Fruity Limiter"`.
+
+flpdiff's existing parser surface uses file-side slot numbers (no
+shift). Code that needs to address FL's runtime API must add `+1`
+to its `slot` value at the boundary, or special-case "events before
+first `0x62`" as FL slot 0.
+
+## Synthesizing FLPs with single-plugin contents
+
+Goal: programmatically craft a clean FLP carrying ONE specified
+plugin in a known mixer slot, suitable as input to RE tools like
+`sweep_plugin_layout`. Status as of 2026-05-09: **partial — FL UI
+recognizes the plugin but IPC runtime API doesn't always bind it.**
+
+What works:
+- Splicing the 6-event slot scope (`0xC9` internal name + `0xD4`
+  runtime data + `0x9B` / `0x80` / `0x29` metadata + `0xD5` plugin
+  state) from a working donor FLP into a target slot of a clean
+  base.
+- flpdiff's parser correctly reports the spliced plugin at the new
+  scope.
+- FL opens the file without errors and renders the plugin's UI
+  window when the slot is clicked.
+
+What doesn't (yet):
+- `plugins.getPluginName(insert, slot)` returns "Plugin not valid"
+  for the spliced plugin in some cases.
+- `plugins.setParamValue` refuses to bind a parameter on the slot.
+
+Confirmed NOT the cause:
+- `0xEC` INSERT_FLAGS payload (12 bytes) — byte-identical between
+  the working donor and a base file.
+- `0xE1` MixerParams record set — same 577 records, same 181
+  distinct (insert, slot) combos.
+- `0xE7` insert routing — copied as-is in the splice.
+
+Suspected: a project-level metadata blob (still under
+investigation) ties the slot to a "loaded" state that purely-static
+event copying doesn't reproduce. Multi-hour follow-up RE deferred.
+
+**Workaround**: have FL itself save a base fixture once per plugin
+(drag plugin → File → Save As `base_<plugin>.flp`); the resulting
+file is a valid sweep input. The on-disk shape is identical to
+what synthesis tries to produce, but FL's "saved" version carries
+whatever the missing context is.
+
 ## Changelog
 
 - **2026-04-16** — Initial version. Tempo at bytes 155-158 as
