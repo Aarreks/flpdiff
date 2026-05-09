@@ -117,6 +117,11 @@ const READ_KINDS = new Set([
   "list_arrangements",
   "list_tracks",
   "list_clips",
+  // Epic 6 / F6.3 — smart discovery (token-saving fuzzy lookups)
+  "find_channel_by_name",
+  "find_insert_by_name",
+  "find_pattern_by_name",
+  "find_plugin_instances",
 ]);
 
 const WRITE_KINDS = new Set([
@@ -159,6 +164,17 @@ const WRITE_KINDS = new Set([
   "set_channel_volume",
   "set_channel_pan",
 ]);
+
+/**
+ * Name-matcher used by `find_*_by_name` discovery kinds. `fuzzy=true`
+ * (default) does case-insensitive substring; `fuzzy=false` requires
+ * exact match. Empty / undefined names never match.
+ */
+function matchesName(name: string | undefined, query: string, fuzzy: boolean): boolean {
+  if (!name || !query) return false;
+  if (fuzzy) return name.toLowerCase().includes(query.toLowerCase());
+  return name === query;
+}
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
   const kind = args["kind"];
@@ -318,6 +334,10 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   list_arrangements: new Set(["path"]),
   list_tracks: new Set(["path", "arrangement"]),
   list_clips: new Set(["path", "arrangement"]),
+  find_channel_by_name: new Set(["path", "query", "fuzzy"]),
+  find_insert_by_name: new Set(["path", "query", "fuzzy"]),
+  find_pattern_by_name: new Set(["path", "query", "fuzzy"]),
+  find_plugin_instances: new Set(["path", "plugin_name"]),
   // writes
   set_tempo: new Set(["path", "bpm"]),
   set_pattern_name: new Set(["path", "iid", "name"]),
@@ -1246,6 +1266,67 @@ function execute(req: BridgeRequest): BridgeResponse {
             }),
           },
         };
+      }
+
+      case "find_channel_by_name": {
+        const summary = buildProjectSummary(project);
+        const query = String((args["query"] ?? "") as unknown);
+        const fuzzy = (args["fuzzy"] ?? true) !== false;
+        const matches = summary.channels.filter((c) => matchesName(c.name, query, fuzzy)).map((c) => ({
+          iid: c.iid,
+          name: c.name ?? null,
+          kind: c.kind,
+        }));
+        return { ok: true, kind, result: matches };
+      }
+
+      case "find_insert_by_name": {
+        const summary = buildProjectSummary(project);
+        const query = String((args["query"] ?? "") as unknown);
+        const fuzzy = (args["fuzzy"] ?? true) !== false;
+        const matches = summary.inserts.filter((i) => matchesName(i.name, query, fuzzy)).map((i) => ({
+          index: i.index,
+          name: i.name ?? null,
+        }));
+        return { ok: true, kind, result: matches };
+      }
+
+      case "find_pattern_by_name": {
+        const summary = buildProjectSummary(project);
+        const query = String((args["query"] ?? "") as unknown);
+        const fuzzy = (args["fuzzy"] ?? true) !== false;
+        const matches = summary.patterns.filter((p) => matchesName(p.name, query, fuzzy)).map((p) => ({
+          id: p.id,
+          name: p.name ?? null,
+          notes: p.notes.length,
+        }));
+        return { ok: true, kind, result: matches };
+      }
+
+      case "find_plugin_instances": {
+        const summary = buildProjectSummary(project);
+        const target = String((args["plugin_name"] ?? "") as unknown).toLowerCase();
+        const matches: Array<Record<string, unknown>> = [];
+        for (const ch of summary.channels) {
+          const n = ch.plugin?.name ?? ch.plugin?.internalName;
+          if (n && n.toLowerCase().includes(target)) {
+            matches.push({ scope: "channel", channel_index: ch.iid, name: n });
+          }
+        }
+        for (const ins of summary.inserts) {
+          for (const slot of ins.slots) {
+            const n = slot.plugin?.name ?? slot.pluginName;
+            if (n && n.toLowerCase().includes(target)) {
+              matches.push({
+                scope: "mixer",
+                insert_index: ins.index,
+                slot_index: slot.index,
+                name: n,
+              });
+            }
+          }
+        }
+        return { ok: true, kind, result: matches };
       }
 
       case "list_clips": {
