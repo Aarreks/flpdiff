@@ -60,33 +60,93 @@ Run cost: ~0.5 s per parameter (set + save + re-parse). Fruity Limiter
 Prerequisites: Mac unlocked, FL Studio installed with Accessibility
 permissions, MIDI script live (`verify_setup` returns ok).
 
-### Example: RE'ing Fruity Reeverb 2
+### End-to-end pipeline (no manual FL save needed)
+
+The synthesis tool `flpdiff/src/synth/craft-plugin-fixture.ts` builds
+a clean single-plugin FLP from a donor file (any FLP that already has
+the plugin instantiated). Combined with `sweep_plugin_layout.py`, the
+full flow takes ~1 minute per plugin and runs without touching FL's
+UI.
 
 ```bash
-# 1. Make a baseline FLP with Reeverb 2 in a known mixer slot.
-#    (Drag the plugin onto, e.g., insert 1 / slot 0, save as
-#    base_reeverb.flp.)
+# Pick a donor FLP that has the plugin you want to RE.
+DONOR=tests/corpus/local/junie.flp           # has many native plugins
+BASELINE=tests/corpus/re_base/fl25/base_empty.flp
+PLUGIN="Fruity Limiter"
+OUT=/tmp/base_limiter.flp
 
-# 2. Run the sweep:
-python -m tools.re_harness.sweep_plugin_layout \
-    --baseline path/to/base_reeverb.flp \
-    --scope mixer --insert 1 --slot 0 \
-    --plugin-name "Fruity Reeverb 2" \
-    --output reeverb2_layout.ts
+# 1. Craft a clean fixture: base_empty + the plugin's slot scope
+#    spliced into master at file-slot-marker 7 (FL IPC slot 8).
+bun src/synth/craft-plugin-fixture.ts \
+    --baseline "$BASELINE" \
+    --donor "$DONOR" \
+    --plugin "$PLUGIN" \
+    --out "$OUT"
+# Output: extracts 6 events from donor, writes ~46 KB FLP, prints
+# "FL IPC slot index = 8"
 
-# 3. Review reeverb2_layout.ts. Sanity-check:
+# 2. Cold-restart FL with the fixture (most reliable IPC recovery).
+cd python && FLPDIFF_HARNESS_INBOX="$HOME/Documents/Image-Line/FL Studio/Settings/Hardware/flstudio-mcp/runtime" \
+  python -c "
+from pathlib import Path
+from tools.re_harness.autodrive import restart_fl, wait_for_clean_fl
+restart_fl(flp_path=Path('$OUT'), wait_seconds=22.0)
+print('IPC:', wait_for_clean_fl(max_attempts=12, dismiss_per_attempt=3, retry_delay=3.0))
+"
+
+# 3. Sweep the plugin's params via FL IPC. Note: target-slot uses
+#    the FL IPC slot index (= file-slot-marker + 1), so for a fixture
+#    crafted at default slot-marker=7, pass --slot 8.
+FLPDIFF_HARNESS_INBOX="$HOME/Documents/Image-Line/FL Studio/Settings/Hardware/flstudio-mcp/runtime" \
+  python -m tools.re_harness.sweep_plugin_layout \
+    --baseline "$OUT" \
+    --scope mixer --insert 0 --slot 8 \
+    --plugin-name "$PLUGIN" \
+    --output /tmp/limiter_layout.ts
+# Output: per-param diff offsets, blob size info, TS snippet ready
+# to paste into PLUGIN_PARAM_LAYOUTS
+
+# 4. Review limiter_layout.ts. Sanity-check:
 #    - All params have non-empty differing_offsets (no missed/no-op
 #      params).
 #    - Offsets are sensibly clustered (no apparent garbage).
-#    - For u32-or-f32 slots, manually verify by checking whether the
-#      patched bytes match round(0.5 * 0xFFFFFFFF) (u32) or
-#      0x3F000000 (f32 = 0.5).
-#    - minSize and maxSize make sense for the blob's true scope.
+#    - For u32-or-f32 slots (4-byte diffs), manually verify by
+#      checking whether the patched bytes match round(0.5 * 0xFFFFFFFF)
+#      (u32) or 0x3F000000 (f32 = 0.5). Encoder doesn't yet support
+#      these field types, so they're commented out in the snippet.
+#    - minSize/maxSize make sense (cross-check against real-corpus
+#      survey of the plugin's blob size).
 
-# 4. Paste the snippet into
-#    flpdiff/src/mutations/index.ts::PLUGIN_PARAM_LAYOUTS,
-#    add a test, commit.
+# 5. Paste the layout into flpdiff/src/mutations/index.ts under
+#    PLUGIN_PARAM_LAYOUTS (with both name variants if FL emits
+#    capitalisation drift), add a real-corpus blob-size survey
+#    comment, commit.
 ```
+
+**Important env quirk**: `FLPDIFF_HARNESS_INBOX` must point to the
+`flstudio-mcp/runtime` directory under `~/Documents/Image-Line/FL
+Studio/Settings/Hardware/`. Without it, `default_inbox()` falls back
+to the legacy `flpdiff-harness/runtime` path and IPC silently writes
+into the wrong directory (probes time out though FL is fine). Set it
+inline on each `python` invocation — Bash subprocesses don't inherit
+`export` from sibling commands.
+
+### IPC instability — what to do when handshake fails
+
+FL's MIDI script polling can stall after project switches. Symptoms:
+`noop` works once after a fresh boot, then subsequent commands time
+out. Recovery options (`autodrive` helpers, in order of effort):
+
+1. **`wait_for_clean_fl(restart_after=N)`**: dismisses up to N modals
+   then force-restarts FL with the baseline. Auto-wired into
+   `sweep_plugin_layout`.
+2. **Manual `restart_fl(flp_path)`**: kills FL via `kill -9`, waits
+   3 s for macOS reaping, relaunches with the FLP loaded. Cold boot
+   re-initialises the script's polling loop reliably.
+3. **Worst case**: open FL → Options → MIDI Settings → toggle the
+   IAC Bus 1 row's "Enable" off then on, set Controller type back
+   to `flstudio-mcp`. Save settings. (D-32 — hot-reload doesn't
+   work; only fresh boot does.)
 
 ## Plugin coverage status
 
@@ -94,8 +154,6 @@ Pending RE (priority by corpus frequency):
 
 | Plugin | Local-corpus instances | Priority |
 |---|--:|---|
-| Fruity Reeverb 2 | 225 | high |
-| Fruity Limiter | 174 | high |
 | Maximus | 88 | medium |
 | Soundgoodizer | 88 | medium |
 | Fruity Balance | 82 | medium |
@@ -111,9 +169,11 @@ Pending RE (priority by corpus frequency):
 
 Shipped:
 
-| Plugin | Status |
-|---|---|
-| Fruity Parametric EQ 2 (both name variants) | ✅ F2.4 |
+| Plugin | Status | Coverage |
+|---|---|---|
+| Fruity Parametric EQ 2 (both name variants) | ✅ F2.4 | structured refs (band/main_level) |
+| Fruity Reeverb 2 (both name variants) | ✅ via sweep | 14/15 params (Stereo separation = 4-byte slot, deferred) |
+| Fruity Limiter | ✅ via sweep | 16/18 params (Comp ratio + knee = 4-byte slots, deferred) |
 
 ## VST plugins explicitly out of scope
 
