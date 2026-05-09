@@ -653,6 +653,7 @@ function noteAt(opts: {
     length: opts.length,
     key: opts.key,
     flags: opts.flags ?? 0,
+    slide: false,
     group: 0,
     fine_pitch: 120,
     release: 64,

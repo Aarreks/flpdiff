@@ -43,6 +43,12 @@ export type SlotSummary = {
   index: number;
   pluginName?: string;
   hasPlugin?: boolean;
+  /**
+   * Unified plugin descriptor for filled slots. `name` falls back to the
+   * native `pluginName` when no VST display name was extracted. `vendor`
+   * is `null` for native plugins (no `0xD5` vendor record).
+   */
+  plugin?: { name: string; vendor: string | null };
 };
 
 export type InsertSummary = {
@@ -114,6 +120,10 @@ function pickInsert(ins: FLPProject["inserts"][number]): InsertSummary {
       const slot: SlotSummary = { index: s.index };
       if (s.pluginName !== undefined) slot.pluginName = s.pluginName;
       if (s.hasPlugin !== undefined) slot.hasPlugin = s.hasPlugin;
+      if (s.hasPlugin === true) {
+        const name = s.pluginVstName ?? s.pluginName ?? s.internalName ?? "Unknown";
+        slot.plugin = { name, vendor: s.pluginVendor ?? null };
+      }
       return slot;
     }),
   };

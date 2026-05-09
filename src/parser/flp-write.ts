@@ -168,6 +168,25 @@ class ByteSliceOutput {
     this.position += bytes;
   }
 
+  // typed-binary 4.x ISerialOutput surface — unused by FLP serializer
+  // (no f16 / no slice / no random-access seeks needed) but present so
+  // the type-check accepts ByteSliceOutput as ISerialOutput.
+  writeFloat16(_value: number): void {
+    throw new Error("ByteSliceOutput.writeFloat16 not implemented");
+  }
+
+  writeSlice(bufferView: { byteLength: number; buffer: ArrayBufferLike; byteOffset: number }): void {
+    const src = new Uint8Array(bufferView.buffer, bufferView.byteOffset, bufferView.byteLength);
+    this.buffer.set(src, this.position);
+    this.position += src.byteLength;
+  }
+
+  seekTo(offset: number): void {
+    this.position = offset;
+  }
+
+  readonly endianness: "little" | "big" = "little";
+
   get currentByteOffset(): number {
     return this.position;
   }

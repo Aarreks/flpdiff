@@ -2321,7 +2321,7 @@ function decodeUtf16LeNullTerminated(payload: Uint8Array): string {
   let end = payload.byteLength;
   // Strip trailing UTF-16LE NUL pairs.
   while (end >= 2 && payload[end - 1] === 0 && payload[end - 2] === 0) end -= 2;
-  return new TextDecoder("utf-16le").decode(payload.subarray(0, end));
+  return new TextDecoder("utf-16le" as "utf-8").decode(payload.subarray(0, end));
 }
 
 /**

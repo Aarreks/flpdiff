@@ -1056,8 +1056,8 @@ function execute(req: BridgeRequest): BridgeResponse {
             plugins.push({
               scope: "channel",
               channel_index: ch.iid,
-              name: ch.plugin.name,
-              vendor: ch.plugin.vendor,
+              name: ch.plugin.name ?? ch.plugin.internalName,
+              vendor: ch.plugin.vendor ?? null,
             });
           }
         }
