@@ -1401,6 +1401,41 @@ describe("setNativePluginParam — Fruity Parametric EQ 2", () => {
     expect(readU16LE(ev.payload, 0x54)).toBe(Math.round(0.3 * 0xffff));
   });
 
+  test("finds plugin at insert N slot 0 even when no preceding 0x62 marker", () => {
+    // Regression: FL omits the 0x62 NEW_SLOT marker for the FIRST
+    // plugin in an insert — events appear directly after OP_INSERT_FLAGS.
+    // findPluginStateEvent must default curSlotIdx=0 per insert.
+    // Before fix: EVENT_NOT_FOUND because curSlotIdx stayed at -1.
+    const eq2 = new Uint8Array(354);
+    const project: FLPProject = {
+      header: { format: 0, n_channels: 0, ppq: 96 },
+      events: [
+        { kind: "blob", opcode: 0xec, payload: new Uint8Array(0) }, // INSERT_FLAGS opens master (insert 0)
+        { kind: "blob", opcode: 0x93, payload: new Uint8Array(4) }, // master closes -> insert 1
+        { kind: "blob", opcode: 0xec, payload: new Uint8Array(0) }, // INSERT_FLAGS opens insert 1
+        { kind: "blob", opcode: 0xcb, payload: utf16leNul("Fruity Parametric EQ 2") }, // name in slot 0 (no 0x62 yet)
+        { kind: "blob", opcode: 0xd5, payload: eq2 },                                  // state in slot 0
+        { kind: "u16", opcode: 0x62, value: 0 }, // NEW_SLOT 0 closes the implicit slot
+        { kind: "blob", opcode: 0x93, payload: new Uint8Array(4) }, // insert 1 closes
+      ],
+      metadata: {} as never,
+      channels: [],
+      inserts: [],
+      patterns: [],
+      arrangements: [],
+      insertRouting: [],
+    };
+    const mutated = setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "main_level" },
+      0.5,
+    );
+    const ev = mutated.events[4]!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(readU16LE(ev.payload, 0x90)).toBe(0x8000);
+  });
+
   test("targets the correct slot when multiple EQ 2 instances exist", () => {
     const project = makeEQ2Project();
     // Patch insert 2 / slot 3, NOT insert 1 / slot 0.

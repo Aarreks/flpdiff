@@ -2295,7 +2295,11 @@ function findPluginStateEvent(
   // The mixer section opens at the first `OP_INSERT_FLAGS` (0xEC) or
   // `OP_NEW_SLOT` (0x62).
   let insertIdx = 0;
-  let curSlotIdx = -1;
+  // FL doesn't emit a 0x62 marker for the FIRST plugin in an insert —
+  // events appear directly after OP_INSERT_FLAGS in slot 0 scope. Start
+  // each insert at slot 0; subsequent 0x62 markers move the cursor.
+  // (Same convention as the sweep tool's walker; D-32 lesson.)
+  let curSlotIdx = 0;
   let inMixer = false;
   let lastSlotName: string | null = null;
   for (let i = 0; i < events.length; i++) {
@@ -2314,7 +2318,7 @@ function findPluginStateEvent(
     if (ev.opcode === OP_INSERT_END) {
       // Current insert closes here; next events belong to insertIdx + 1.
       insertIdx++;
-      curSlotIdx = -1;
+      curSlotIdx = 0;
       lastSlotName = null;
       continue;
     }
