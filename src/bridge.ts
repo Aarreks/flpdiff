@@ -70,6 +70,13 @@ import {
   setNativePluginParam,
   type PluginParamRef,
   type PluginScope,
+  setPatternLength,
+  transposePatternNotes,
+  quantizePatternNotes,
+  humanizeVelocities,
+  humanizeTimings,
+  reversePatternNotes,
+  invertPatternNotes,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -138,6 +145,14 @@ const WRITE_KINDS = new Set([
   "create_pattern",
   "create_channel",
   "set_native_plugin_param",
+  // Epic 6 / F6.1 — note transformations + pattern length writer
+  "set_pattern_length",
+  "transpose_pattern_notes",
+  "quantize_pattern_notes",
+  "humanize_velocities",
+  "humanize_timings",
+  "reverse_pattern_notes",
+  "invert_pattern_notes",
 ]);
 
 function parsePlacementArg(args: Record<string, unknown>): ClipPlacement {
@@ -390,6 +405,14 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "param_index",
     "value",
   ]),
+  // Epic 6 / F6.1
+  set_pattern_length: new Set(["path", "pattern_id", "ticks"]),
+  transpose_pattern_notes: new Set(["path", "pattern_id", "semitones", "channel_iid"]),
+  quantize_pattern_notes: new Set(["path", "pattern_id", "grid_ticks", "strength"]),
+  humanize_velocities: new Set(["path", "pattern_id", "range", "seed"]),
+  humanize_timings: new Set(["path", "pattern_id", "range_ticks", "seed"]),
+  reverse_pattern_notes: new Set(["path", "pattern_id"]),
+  invert_pattern_notes: new Set(["path", "pattern_id", "axis_key"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -903,6 +926,58 @@ function executeWrite(
         );
       }
       mutated = setNativePluginParam(project, scope, param, value);
+    } else if (kind === "set_pattern_length") {
+      const pid = Number(args["pattern_id"]);
+      const ticks = Number(args["ticks"]);
+      if (!Number.isInteger(pid) || !Number.isInteger(ticks)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id + ticks required (integers)");
+      }
+      mutated = setPatternLength(project, pid, ticks);
+    } else if (kind === "transpose_pattern_notes") {
+      const pid = Number(args["pattern_id"]);
+      const semitones = Number(args["semitones"]);
+      const ch = args["channel_iid"] === undefined ? undefined : Number(args["channel_iid"]);
+      if (!Number.isInteger(pid) || !Number.isInteger(semitones)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id + semitones required (integers)");
+      }
+      mutated = transposePatternNotes(project, pid, semitones, ch);
+    } else if (kind === "quantize_pattern_notes") {
+      const pid = Number(args["pattern_id"]);
+      const grid = Number(args["grid_ticks"]);
+      const strength = args["strength"] === undefined ? 1.0 : Number(args["strength"]);
+      if (!Number.isInteger(pid) || !Number.isInteger(grid)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id + grid_ticks required (integers)");
+      }
+      mutated = quantizePatternNotes(project, pid, grid, strength);
+    } else if (kind === "humanize_velocities") {
+      const pid = Number(args["pattern_id"]);
+      const range = Number(args["range"]);
+      const seed = args["seed"] === undefined ? undefined : Number(args["seed"]);
+      if (!Number.isInteger(pid) || !Number.isInteger(range)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id + range required (integers)");
+      }
+      mutated = humanizeVelocities(project, pid, range, seed);
+    } else if (kind === "humanize_timings") {
+      const pid = Number(args["pattern_id"]);
+      const range = Number(args["range_ticks"]);
+      const seed = args["seed"] === undefined ? undefined : Number(args["seed"]);
+      if (!Number.isInteger(pid) || !Number.isInteger(range)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id + range_ticks required (integers)");
+      }
+      mutated = humanizeTimings(project, pid, range, seed);
+    } else if (kind === "reverse_pattern_notes") {
+      const pid = Number(args["pattern_id"]);
+      if (!Number.isInteger(pid)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id required (integer)");
+      }
+      mutated = reversePatternNotes(project, pid);
+    } else if (kind === "invert_pattern_notes") {
+      const pid = Number(args["pattern_id"]);
+      const axis = args["axis_key"] === undefined ? 60 : Number(args["axis_key"]);
+      if (!Number.isInteger(pid)) {
+        throw new MutationError("INVALID_ARGS", "pattern_id required (integer)");
+      }
+      mutated = invertPatternNotes(project, pid, axis);
     } else if (kind === "create_channel") {
       const name = args["name"];
       const kindArg = args["kind"];

@@ -32,6 +32,13 @@ import {
   createPattern,
   createChannel,
   setNativePluginParam,
+  setPatternLength,
+  transposePatternNotes,
+  quantizePatternNotes,
+  humanizeVelocities,
+  humanizeTimings,
+  reversePatternNotes,
+  invertPatternNotes,
   MutationError,
 } from "../src/mutations/index.ts";
 import type { FLPProject } from "../src/parser/flp-project.ts";
@@ -1665,5 +1672,287 @@ describe("setNativePluginParam — i32_bipolar field type", () => {
     if (ev.kind !== "blob") throw new Error("expected blob");
     expect(ev.payload[0x27]).toBe(0);
     expect(ev.payload[0x2c]).toBe(0);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F6.1 — Note transformations + pattern length writer                          //
+// --------------------------------------------------------------------------- //
+
+function makePatternProject(notes: Array<Partial<{
+  position: number; length: number; key: number; channel_iid: number; velocity: number;
+}>>, opts: { patternLength?: number; channelIid?: number } = {}): FLPProject {
+  const ch = opts.channelIid ?? 1;
+  const fullNotes = notes.map((n) => ({
+    position: n.position ?? 0,
+    channel_iid: n.channel_iid ?? ch,
+    length: n.length ?? 96,
+    key: n.key ?? 60,
+    flags: 0,
+    slide: false,
+    group: 0,
+    fine_pitch: 120,
+    release: 64,
+    midi_channel: 0,
+    pan: 64,
+    velocity: n.velocity ?? 100,
+    mod_x: 128,
+    mod_y: 128,
+  }));
+  const project = loadProject(FIXTURE);
+  let next = setPatternNotes(project, 1, fullNotes);
+  if (opts.patternLength !== undefined) {
+    next = setPatternLength(next, 1, opts.patternLength);
+  }
+  return next;
+}
+
+function notesIn(project: FLPProject, patternId: number) {
+  const reparsed = reparse(project);
+  return reparsed.patterns.find((p) => p.id === patternId)?.notes ?? [];
+}
+
+describe("setPatternLength", () => {
+  test("inserts a 0xA4 event when none exists", () => {
+    const project = loadProject(FIXTURE);
+    const mutated = setPatternLength(project, 1, 384);
+    const reparsed = reparse(mutated);
+    const p = reparsed.patterns.find((x) => x.id === 1)!;
+    expect(p.length).toBe(384);
+  });
+
+  test("replaces existing 0xA4 in-place", () => {
+    const project = setPatternLength(loadProject(FIXTURE), 1, 384);
+    const mutated = setPatternLength(project, 1, 768);
+    const reparsed = reparse(mutated);
+    expect(reparsed.patterns.find((p) => p.id === 1)?.length).toBe(768);
+  });
+
+  test("rejects unknown pattern id", () => {
+    expect(() => setPatternLength(loadProject(FIXTURE), 999, 384)).toThrow(MutationError);
+  });
+
+  test("rejects bad ticks", () => {
+    expect(() => setPatternLength(loadProject(FIXTURE), 1, -1)).toThrow(MutationError);
+    expect(() => setPatternLength(loadProject(FIXTURE), 1, 0xffffffff + 1)).toThrow(MutationError);
+  });
+});
+
+describe("transposePatternNotes", () => {
+  test("shifts every note's key by N semitones", () => {
+    const project = makePatternProject([
+      { position: 0, key: 60 },
+      { position: 96, key: 64 },
+      { position: 192, key: 67 },
+    ]);
+    const mutated = transposePatternNotes(project, 1, 12);
+    const notes = notesIn(mutated, 1);
+    expect(notes.map((n) => n.key)).toEqual([72, 76, 79]);
+  });
+
+  test("clamps to [0, 131] at boundaries", () => {
+    const project = makePatternProject([{ position: 0, key: 0 }, { position: 96, key: 131 }]);
+    const down = transposePatternNotes(project, 1, -10);
+    expect(notesIn(down, 1).map((n) => n.key)).toEqual([0, 121]); // 0 clamped, 131-10=121
+    const up = transposePatternNotes(project, 1, 10);
+    expect(notesIn(up, 1).map((n) => n.key)).toEqual([10, 131]); // 0+10=10, 131 clamped
+  });
+
+  test("channel filter restricts which notes shift", () => {
+    const project = makePatternProject([
+      { channel_iid: 1, key: 60 },
+      { channel_iid: 2, key: 60 },
+    ]);
+    const mutated = transposePatternNotes(project, 1, 7, 1);
+    const byCh = Object.fromEntries(notesIn(mutated, 1).map((n) => [n.channel_iid, n.key]));
+    expect(byCh[1]).toBe(67);
+    expect(byCh[2]).toBe(60); // untouched
+  });
+
+  test("does NOT auto-grow pattern length (pure pitch op)", () => {
+    const project = setPatternLength(makePatternProject([{ position: 0, key: 60 }]), 1, 384);
+    const mutated = transposePatternNotes(project, 1, 12);
+    expect(reparse(mutated).patterns.find((p) => p.id === 1)?.length).toBe(384);
+  });
+
+  test("rejects non-integer semitones", () => {
+    expect(() => transposePatternNotes(loadProject(FIXTURE), 1, 1.5)).toThrow(MutationError);
+  });
+});
+
+describe("quantizePatternNotes", () => {
+  test("snaps positions to grid (full strength)", () => {
+    const project = makePatternProject([
+      { position: 5, length: 96 },
+      { position: 100, length: 96 },
+      { position: 191, length: 96 },
+    ]);
+    const mutated = quantizePatternNotes(project, 1, 96, 1.0);
+    expect(notesIn(mutated, 1).map((n) => n.position).sort((a, b) => a - b)).toEqual([0, 96, 192]);
+  });
+
+  test("strength=0.5 moves halfway to grid", () => {
+    const project = makePatternProject([{ position: 20, length: 96 }]);
+    const mutated = quantizePatternNotes(project, 1, 96, 0.5);
+    expect(notesIn(mutated, 1)[0]!.position).toBe(10); // halfway from 20 to 0
+  });
+
+  test("auto-grows pattern length when notes extend past current", () => {
+    const project = setPatternLength(
+      makePatternProject([{ position: 0, length: 384 }]),
+      1,
+      384,
+    );
+    const mutated = quantizePatternNotes(project, 1, 192, 1.0);
+    // note at 0 stays; length 384 → end tick 384 → fits exactly. add a
+    // second case where we move a note past the boundary.
+    const project2 = setPatternLength(
+      makePatternProject([{ position: 350, length: 96 }]),
+      1,
+      384,
+    );
+    const mutated2 = quantizePatternNotes(project2, 1, 96, 1.0);
+    // position snaps to 384 (nearest 96 mult); length 96; end tick = 480.
+    // pattern length should auto-grow to 480 (rounded up to next beat = 480 = 5*96).
+    const len2 = reparse(mutated2).patterns.find((p) => p.id === 1)?.length ?? 0;
+    expect(len2).toBeGreaterThanOrEqual(480);
+    void mutated;
+  });
+
+  test("rejects invalid grid or strength", () => {
+    expect(() => quantizePatternNotes(loadProject(FIXTURE), 1, 0)).toThrow(MutationError);
+    expect(() => quantizePatternNotes(loadProject(FIXTURE), 1, 96, -0.1)).toThrow(MutationError);
+    expect(() => quantizePatternNotes(loadProject(FIXTURE), 1, 96, 1.1)).toThrow(MutationError);
+  });
+});
+
+describe("humanizeVelocities", () => {
+  test("range=0 is a no-op", () => {
+    const project = makePatternProject([{ velocity: 100 }, { velocity: 80 }]);
+    const mutated = humanizeVelocities(project, 1, 0);
+    expect(notesIn(mutated, 1).map((n) => n.velocity)).toEqual([100, 80]);
+  });
+
+  test("deterministic with seed; values stay in [1, 127]", () => {
+    const project = makePatternProject(
+      Array.from({ length: 20 }, () => ({ velocity: 100 })),
+    );
+    const a = humanizeVelocities(project, 1, 30, 42);
+    const b = humanizeVelocities(project, 1, 30, 42);
+    const va = notesIn(a, 1).map((n) => n.velocity);
+    const vb = notesIn(b, 1).map((n) => n.velocity);
+    expect(va).toEqual(vb);
+    for (const v of va) {
+      expect(v).toBeGreaterThanOrEqual(1);
+      expect(v).toBeLessThanOrEqual(127);
+    }
+    // At least some notes should be different from baseline (seeded RNG).
+    const changes = va.filter((v) => v !== 100).length;
+    expect(changes).toBeGreaterThan(10);
+  });
+
+  test("rejects negative range", () => {
+    expect(() => humanizeVelocities(loadProject(FIXTURE), 1, -1)).toThrow(MutationError);
+  });
+});
+
+describe("humanizeTimings", () => {
+  test("deterministic with seed; positions clamp to >= 0", () => {
+    const project = makePatternProject([
+      { position: 5, length: 96 },
+      { position: 200, length: 96 },
+    ]);
+    const a = humanizeTimings(project, 1, 20, 7);
+    const b = humanizeTimings(project, 1, 20, 7);
+    expect(notesIn(a, 1).map((n) => n.position)).toEqual(notesIn(b, 1).map((n) => n.position));
+    for (const n of notesIn(a, 1)) expect(n.position).toBeGreaterThanOrEqual(0);
+  });
+
+  test("auto-grows pattern length if a note shifts past current", () => {
+    const project = setPatternLength(
+      makePatternProject([{ position: 380, length: 96 }]),
+      1,
+      384,
+    );
+    // Force a positive jitter via a seed that pushes the note further right.
+    // Sweep a few seeds until we find one that grows the pattern.
+    for (let s = 1; s < 100; s++) {
+      const mutated = humanizeTimings(project, 1, 50, s);
+      const len = reparse(mutated).patterns.find((p) => p.id === 1)?.length ?? 0;
+      const notes = notesIn(mutated, 1);
+      const endTick = notes[0]!.position + notes[0]!.length;
+      if (endTick > 384) {
+        expect(len).toBeGreaterThanOrEqual(endTick);
+        return;
+      }
+    }
+    throw new Error("no seed pushed the note past pattern length");
+  });
+});
+
+describe("reversePatternNotes", () => {
+  test("mirrors positions about pattern length", () => {
+    const project = setPatternLength(
+      makePatternProject([
+        { position: 0, length: 96 },
+        { position: 192, length: 96 },
+      ]),
+      1,
+      384,
+    );
+    const mutated = reversePatternNotes(project, 1);
+    const positions = notesIn(mutated, 1).map((n) => n.position).sort((a, b) => a - b);
+    // pos=0 len=96   -> 384 - 0 - 96 = 288
+    // pos=192 len=96 -> 384 - 192 - 96 = 96
+    expect(positions).toEqual([96, 288]);
+  });
+
+  test("falls back to notesEndTick when no 0xA4 set", () => {
+    const project = makePatternProject([
+      { position: 0, length: 96 },
+      { position: 96, length: 96 },
+    ]);
+    // Pattern length defaults to 0 (FL "use project default") — fallback
+    // axis = max(position+length) = 192.
+    const mutated = reversePatternNotes(project, 1);
+    const positions = notesIn(mutated, 1).map((n) => n.position).sort((a, b) => a - b);
+    expect(positions).toEqual([0, 96]);
+  });
+
+  test("empty pattern is a no-op", () => {
+    const project = loadProject(FIXTURE); // base has 1 note, drop it
+    const empty = setPatternNotes(project, 1, []);
+    const mutated = reversePatternNotes(empty, 1);
+    expect(notesIn(mutated, 1)).toHaveLength(0);
+  });
+});
+
+describe("invertPatternNotes", () => {
+  test("mirrors keys about axisKey (default 60)", () => {
+    const project = makePatternProject([
+      { key: 55 }, // -> 65
+      { key: 60 }, // -> 60 (axis)
+      { key: 67 }, // -> 53
+    ]);
+    const mutated = invertPatternNotes(project, 1);
+    expect(notesIn(mutated, 1).map((n) => n.key).sort((a, b) => a - b)).toEqual([53, 60, 65]);
+  });
+
+  test("custom axis key", () => {
+    const project = makePatternProject([{ key: 70 }]);
+    const mutated = invertPatternNotes(project, 1, 72);
+    expect(notesIn(mutated, 1)[0]!.key).toBe(74); // 2*72 - 70
+  });
+
+  test("clamps to [0, 131] at boundaries", () => {
+    const project = makePatternProject([{ key: 130 }]);
+    const mutated = invertPatternNotes(project, 1, 60);
+    // 2*60 - 130 = -10 → clamp to 0
+    expect(notesIn(mutated, 1)[0]!.key).toBe(0);
+  });
+
+  test("rejects axisKey out of range", () => {
+    expect(() => invertPatternNotes(loadProject(FIXTURE), 1, -1)).toThrow(MutationError);
+    expect(() => invertPatternNotes(loadProject(FIXTURE), 1, 200)).toThrow(MutationError);
   });
 });

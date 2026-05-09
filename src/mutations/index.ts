@@ -2485,3 +2485,316 @@ export function setNativePluginParam(
   events[eventIdx] = { kind: "blob", opcode: OP_PLUGIN_STATE, payload: newPayload };
   return { ...project, events };
 }
+
+// --------------------------------------------------------------------------- //
+// F6.1 — Note transformations + pattern length writer                          //
+// --------------------------------------------------------------------------- //
+//
+// Pure-data ops on existing notes. Each helper reads the pattern's
+// notes via collectExistingNotes(), applies the transform, and writes
+// back via setPatternNotes() — so the encoder/decoder round-trip
+// guarantees still hold.
+//
+// Auto-grow: any helper that may move a note's `position + length`
+// past the current pattern length (`0xA4`) bumps the length to the
+// next beat boundary (D-60a). Helpers that only mutate `key` or
+// `velocity` leave length alone.
+
+const OP_PATTERN_NEW_FOR_LEN = 0x41;
+
+/**
+ * Write or update the pattern-length scalar (`0xA4` u32 PPQ ticks)
+ * inside a pattern's scope. Adds the event right after `0xC1`
+ * (pattern name) if not present; replaces in-place otherwise.
+ *
+ * Throws `EVENT_NOT_FOUND` if the pattern id doesn't exist.
+ */
+export function setPatternLength(
+  project: FLPProject,
+  patternId: number,
+  ticks: number,
+): FLPProject {
+  if (!Number.isInteger(patternId) || patternId < 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern id must be a positive integer (1-based), got ${patternId}`,
+    );
+  }
+  if (!Number.isInteger(ticks) || ticks < 0 || ticks > 0xffffffff) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `pattern length must be a non-negative u32, got ${ticks}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const events = [...project.events];
+  for (let i = scope.startIdx + 1; i < scope.endIdx; i++) {
+    if (events[i]!.opcode === OP_PATTERN_LENGTH) {
+      events[i] = { kind: "u32", opcode: OP_PATTERN_LENGTH, value: ticks };
+      return { ...project, events };
+    }
+  }
+  // Insert after the pattern-name event (0xC1) if present, else right
+  // after the 0x41 opener.
+  let insertAt = scope.startIdx + 1;
+  for (let i = scope.startIdx + 1; i < scope.endIdx; i++) {
+    if (events[i]!.opcode === OP_PATTERN_NAME) {
+      insertAt = i + 1;
+      break;
+    }
+  }
+  events.splice(insertAt, 0, { kind: "u32", opcode: OP_PATTERN_LENGTH, value: ticks });
+  return { ...project, events };
+}
+
+/**
+ * Find the current pattern-length scalar inside a pattern scope, or
+ * `0` if no `0xA4` event is present (FL semantics: 0 = "use project
+ * default bar length").
+ */
+function findPatternLength(
+  events: readonly FLPEvent[],
+  scope: { startIdx: number; endIdx: number },
+): number {
+  for (let i = scope.startIdx + 1; i < scope.endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.opcode === OP_PATTERN_LENGTH && ev.kind === "u32") return ev.value;
+  }
+  return 0;
+}
+
+/** Maximum `position + length` across a note list (= pattern's
+ *  required minimum length). */
+function notesEndTick(notes: readonly Note[]): number {
+  let end = 0;
+  for (const n of notes) {
+    const e = n.position + n.length;
+    if (e > end) end = e;
+  }
+  return end;
+}
+
+/** Round `ticks` up to the next beat boundary (`ppq` ticks). Used for
+ *  auto-grow so the pattern length lands on a clean grid. */
+function ceilToBeat(ticks: number, ppq: number): number {
+  if (ppq <= 0) return ticks;
+  return Math.ceil(ticks / ppq) * ppq;
+}
+
+/**
+ * Re-write a pattern's notes AND auto-grow `0xA4` if the new notes
+ * extend past the current length. If `growLength === false`, the
+ * length is left alone (used by transforms that don't change
+ * positions, like transpose).
+ */
+function setPatternNotesAutoGrow(
+  project: FLPProject,
+  patternId: number,
+  notes: readonly Note[],
+  growLength: boolean,
+): FLPProject {
+  let next = setPatternNotes(project, patternId, notes);
+  if (!growLength) return next;
+  const scope = findPatternScope(next.events, patternId)!;
+  const currentLen = findPatternLength(next.events, scope);
+  const required = notesEndTick(notes);
+  if (currentLen > 0 && required > currentLen) {
+    next = setPatternLength(next, patternId, ceilToBeat(required, next.header.ppq));
+  }
+  return next;
+}
+
+/** Mulberry32 — small deterministic PRNG; seedable for tests. */
+function mulberry32(seed: number): () => number {
+  let t = seed >>> 0;
+  return () => {
+    t = (t + 0x6d2b79f5) >>> 0;
+    let r = t;
+    r = Math.imul(r ^ (r >>> 15), r | 1);
+    r ^= r + Math.imul(r ^ (r >>> 7), r | 61);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function clampInt(value: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, Math.round(value)));
+}
+
+/**
+ * Shift every note's `key` by `semitones`. Optional `channelIid`
+ * filter restricts the transform to one channel; otherwise every
+ * note in the pattern is shifted.
+ *
+ * Notes whose post-shift key would fall outside `[0, 131]` clip to
+ * the boundary (FL's valid key range) — silently, since per-note
+ * skipping would corrupt chord groupings.
+ */
+export function transposePatternNotes(
+  project: FLPProject,
+  patternId: number,
+  semitones: number,
+  channelIid?: number,
+): FLPProject {
+  if (!Number.isInteger(semitones)) {
+    throw new MutationError("INVALID_ARGS", `semitones must be an integer, got ${semitones}`);
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+  const next = existing.map((n) => {
+    if (channelIid !== undefined && n.channel_iid !== channelIid) return n;
+    return { ...n, key: clampInt(n.key + semitones, 0, 131) };
+  });
+  return setPatternNotesAutoGrow(project, patternId, next, /* growLength */ false);
+}
+
+/**
+ * Snap every note's `position` to the nearest multiple of `gridTicks`.
+ * `strength` ∈ [0, 1] controls partial quantization (1 = full snap,
+ * 0.5 = move halfway to grid, 0 = no-op). Auto-grows pattern length
+ * if any note now extends past it.
+ */
+export function quantizePatternNotes(
+  project: FLPProject,
+  patternId: number,
+  gridTicks: number,
+  strength: number = 1.0,
+): FLPProject {
+  if (!Number.isInteger(gridTicks) || gridTicks <= 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `gridTicks must be a positive integer, got ${gridTicks}`,
+    );
+  }
+  if (!Number.isFinite(strength) || strength < 0 || strength > 1) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `strength must be in [0, 1], got ${strength}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+  const next = existing.map((n) => {
+    const target = Math.round(n.position / gridTicks) * gridTicks;
+    const newPos = Math.round(n.position + (target - n.position) * strength);
+    return { ...n, position: Math.max(0, newPos) };
+  });
+  return setPatternNotesAutoGrow(project, patternId, next, /* growLength */ true);
+}
+
+/**
+ * Add ±`range` jitter to every note's `velocity`. Result clamped to
+ * `[1, 127]` (0 would silently mute). `seed` defaults to `Date.now()`.
+ */
+export function humanizeVelocities(
+  project: FLPProject,
+  patternId: number,
+  range: number,
+  seed?: number,
+): FLPProject {
+  if (!Number.isInteger(range) || range < 0) {
+    throw new MutationError("INVALID_ARGS", `range must be a non-negative integer, got ${range}`);
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+  if (range === 0) return setPatternNotesAutoGrow(project, patternId, existing, false);
+  const rand = mulberry32(seed ?? Date.now());
+  const next = existing.map((n) => {
+    const jitter = Math.round((rand() * 2 - 1) * range);
+    return { ...n, velocity: clampInt(n.velocity + jitter, 1, 127) };
+  });
+  return setPatternNotesAutoGrow(project, patternId, next, /* growLength */ false);
+}
+
+/**
+ * Add ±`rangeTicks` jitter to every note's `position`. Negative
+ * positions clamp to 0. Auto-grows pattern length if any note now
+ * extends past it. `seed` defaults to `Date.now()`.
+ */
+export function humanizeTimings(
+  project: FLPProject,
+  patternId: number,
+  rangeTicks: number,
+  seed?: number,
+): FLPProject {
+  if (!Number.isInteger(rangeTicks) || rangeTicks < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `rangeTicks must be a non-negative integer, got ${rangeTicks}`,
+    );
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+  if (rangeTicks === 0) return setPatternNotesAutoGrow(project, patternId, existing, true);
+  const rand = mulberry32(seed ?? Date.now());
+  const next = existing.map((n) => {
+    const jitter = Math.round((rand() * 2 - 1) * rangeTicks);
+    return { ...n, position: Math.max(0, n.position + jitter) };
+  });
+  return setPatternNotesAutoGrow(project, patternId, next, /* growLength */ true);
+}
+
+/**
+ * Mirror notes in time around the pattern's midpoint. A note at
+ * position `p` with length `l` ends up at `pattern_length - p - l`
+ * (so its tail still sits inside the original window). Falls back
+ * to `notesEndTick(notes)` as the mirror axis when `0xA4` is absent
+ * (FL semantics: 0 = "use project default", which we can't compute
+ * here).
+ */
+export function reversePatternNotes(
+  project: FLPProject,
+  patternId: number,
+): FLPProject {
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+  if (existing.length === 0) return project;
+  const declaredLen = findPatternLength(project.events, scope);
+  const axis = declaredLen > 0 ? declaredLen : notesEndTick(existing);
+  const next = existing.map((n) => ({
+    ...n,
+    position: Math.max(0, axis - n.position - n.length),
+  }));
+  return setPatternNotesAutoGrow(project, patternId, next, /* growLength */ false);
+}
+
+/**
+ * Mirror notes in pitch around `axisKey` (default 60 = middle C).
+ * `key' = clamp(2 * axisKey - key, 0, 131)`. Velocities + timings
+ * preserved.
+ */
+export function invertPatternNotes(
+  project: FLPProject,
+  patternId: number,
+  axisKey: number = 60,
+): FLPProject {
+  if (!Number.isInteger(axisKey) || axisKey < 0 || axisKey > 131) {
+    throw new MutationError("INVALID_ARGS", `axisKey must be in [0, 131], got ${axisKey}`);
+  }
+  const scope = findPatternScope(project.events, patternId);
+  if (!scope) {
+    throw new MutationError("EVENT_NOT_FOUND", `no pattern with id=${patternId} found`);
+  }
+  const existing = collectExistingNotes(project.events, scope);
+  const next = existing.map((n) => ({ ...n, key: clampInt(2 * axisKey - n.key, 0, 131) }));
+  return setPatternNotesAutoGrow(project, patternId, next, /* growLength */ false);
+}
+
+void OP_PATTERN_NEW_FOR_LEN;
