@@ -2180,11 +2180,53 @@ const REEVERB2_LAYOUT: PluginLayout = {
   },
 };
 
+/**
+ * Fruity Limiter layout — 18 params, RE'd via `sweep_plugin_layout.py`
+ * 2026-05-09 against synthesized `base_limiter.flp` (base_empty +
+ * junie's master slot 7 spliced via `craft-plugin-fixture.ts`).
+ *
+ * Real-corpus coverage: every Fruity Limiter saved-once instance is
+ * 169 bytes. minSize=169 (strict). maxSize=219 (50-byte tolerance for
+ * future FL versions adding trailing state).
+ *
+ * Param 9 (Comp ratio) and param 10 (Comp knee) write 4 consecutive
+ * bytes — likely float32 LE. Encoder skips them until field-type
+ * supports `u32` / `f32`. The other 16 params are u8/u16 LE and
+ * write cleanly via `round(v * 0xFF)` / `round(v * 0xFFFF)`.
+ */
+const LIMITER_LAYOUT: PluginLayout = {
+  minSize: 169,
+  maxSize: 219,
+  paramRefToOffset: (ref) => {
+    if (ref.kind !== "param") return null;
+    if (ref.index === 0) return { offset: 0x04, fieldType: "u16" }; // Gain
+    if (ref.index === 1) return { offset: 0x08, fieldType: "u16" }; // Soft saturation threshold
+    if (ref.index === 2) return { offset: 0x0c, fieldType: "u16" }; // Limiter ceiling
+    if (ref.index === 3) return { offset: 0x10, fieldType: "u16" }; // Limiter attack time
+    if (ref.index === 4) return { offset: 0x14, fieldType: "u8" };  // Limiter attack curve
+    if (ref.index === 5) return { offset: 0x18, fieldType: "u16" }; // Limiter release time
+    if (ref.index === 6) return { offset: 0x1c, fieldType: "u8" };  // Limiter release curve
+    if (ref.index === 7) return { offset: 0x20, fieldType: "u16" }; // Limiter peak window
+    if (ref.index === 8) return { offset: 0x24, fieldType: "u16" }; // Comp threshold
+    // Param 9 (Comp ratio, 4 bytes at 0x28) — u32 or float32, skipped.
+    // Param 10 (Comp knee, 4 bytes at 0x2c) — u32 or float32, skipped.
+    if (ref.index === 11) return { offset: 0x30, fieldType: "u16" }; // Comp attack time
+    if (ref.index === 12) return { offset: 0x34, fieldType: "u16" }; // Comp release time
+    if (ref.index === 13) return { offset: 0x38, fieldType: "u8" };  // Comp curve
+    if (ref.index === 14) return { offset: 0x3c, fieldType: "u16" }; // Comp RMS window
+    if (ref.index === 15) return { offset: 0x40, fieldType: "u16" }; // Noise gain
+    if (ref.index === 16) return { offset: 0x44, fieldType: "u16" }; // Noise threshold
+    if (ref.index === 17) return { offset: 0x48, fieldType: "u16" }; // Noise release time
+    return null;
+  },
+};
+
 const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
   "Fruity Parametric EQ 2": EQ2_LAYOUT,
   "Fruity parametric EQ 2": EQ2_LAYOUT,
   "Fruity Reeverb 2": REEVERB2_LAYOUT,
   "Fruity reeverb 2": REEVERB2_LAYOUT,
+  "Fruity Limiter": LIMITER_LAYOUT,
 };
 
 /**
