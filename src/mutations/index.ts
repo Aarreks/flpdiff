@@ -2136,9 +2136,55 @@ const EQ2_LAYOUT: PluginLayout = {
  * (mixer slot scope) or via `0xC9` plugin-internal-name. FL 25.2.4
  * inconsistently uses lowercase `parametric` — we register both.
  */
+/**
+ * Fruity Reeverb 2 layout — 15 params, RE'd via `sweep_plugin_layout.py`
+ * 2026-05-09 against insert 22 slot 0 of listen-to-my-synthesizer.flp.
+ *
+ * Real-corpus blob size: 66 bytes (280/280 user-saved instances).
+ * Freshly-instantiated Reeverb 2 emits a 58-byte minimal blob — first
+ * param touch grows it to canonical 66. minSize=66 here keeps the
+ * encoder strict against half-formed blobs.
+ *
+ * **Scale caveat (v1 limitation):** unlike EQ 2 which uniformly stores
+ * params as `round(v * 0xFFFF)`, Reeverb 2 mixes encodings — some
+ * params (Bass multiplier, Crossover, Stereo separation) appear to be
+ * normalized 0..0xFFFF; others (Low cut, High cut, Predelay) store
+ * raw frequency / time values. The encoder still applies the universal
+ * `round(v * 0xFFFF)` (u16) / `round(v * 0xFF)` (u8) mapping; users
+ * who need exact Hz / ms values must compute the normalized fraction
+ * themselves. Future: per-param scale curves in the layout entry.
+ */
+const REEVERB2_LAYOUT: PluginLayout = {
+  minSize: 66,
+  maxSize: 116,
+  paramRefToOffset: (ref) => {
+    if (ref.kind !== "param") return null;
+    if (ref.index === 0) return { offset: 0x04, fieldType: "u16" }; // Low cut (Hz)
+    if (ref.index === 1) return { offset: 0x08, fieldType: "u8" };  // High cut
+    if (ref.index === 2) return { offset: 0x0c, fieldType: "u16" }; // Predelay
+    if (ref.index === 3) return { offset: 0x10, fieldType: "u8" };  // Room size
+    if (ref.index === 4) return { offset: 0x14, fieldType: "u8" };  // Diffusion
+    if (ref.index === 5) return { offset: 0x18, fieldType: "u8" };  // Decay time
+    if (ref.index === 6) return { offset: 0x1c, fieldType: "u8" };  // High damping
+    if (ref.index === 7) return { offset: 0x20, fieldType: "u16" }; // Bass multiplier
+    if (ref.index === 8) return { offset: 0x24, fieldType: "u16" }; // Crossover
+    // Param 9 (Stereo separation) is a 4-byte slot at 0x28 — likely
+    // float32 LE or u32. Encoder doesn't support 4-byte writes yet;
+    // omit until field-type extended.
+    if (ref.index === 10) return { offset: 0x2c, fieldType: "u8" }; // Dry level
+    if (ref.index === 11) return { offset: 0x30, fieldType: "u8" }; // Early reflection level
+    if (ref.index === 12) return { offset: 0x34, fieldType: "u8" }; // Wet level
+    if (ref.index === 13) return { offset: 0x39, fieldType: "u8" }; // Mod Speed
+    if (ref.index === 14) return { offset: 0x3d, fieldType: "u8" }; // Mod Depth
+    return null;
+  },
+};
+
 const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
   "Fruity Parametric EQ 2": EQ2_LAYOUT,
   "Fruity parametric EQ 2": EQ2_LAYOUT,
+  "Fruity Reeverb 2": REEVERB2_LAYOUT,
+  "Fruity reeverb 2": REEVERB2_LAYOUT,
 };
 
 /**
