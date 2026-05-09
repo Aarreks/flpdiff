@@ -12,7 +12,11 @@ type PluginLayout = {
   minSize: number; // last param byte + 1; smaller blobs reject
   maxSize: number; // generous upper bound (rejects unrelated blobs)
   paramRefToOffset: (ref: PluginParamRef) =>
-    { offset: number; fieldType: "u8" | "u16" | "u32" | "f32" } | null;
+    | { offset: number;
+        fieldType: "u8" | "u16" | "u32" | "f32" | "i32_bipolar";
+        scale?: number; // required when fieldType === "i32_bipolar"
+      }
+    | null;
 };
 
 const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
@@ -24,17 +28,29 @@ const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
 
 `paramRefToOffset` is the per-plugin function that maps an LLM-supplied
 `PluginParamRef` (one of `{kind:"main_level"}`, `{kind:"band", band, field}`,
-`{kind:"param", index}`) to a `(offset, fieldType)` pair. The encoder
-writes the normalized [0,1] value as:
+`{kind:"param", index}`) to an offset + field type. Encoder writes the
+normalized [0,1] value as:
 - `u8`: `round(v * 0xFF)`, 1 byte
 - `u16`: `round(v * 0xFFFF)`, 2 bytes LE
 - `u32`: `round(v * 0xFFFFFFFF)`, 4 bytes LE
 - `f32`: IEEE-754 single-precision, 4 bytes LE (raw `v`, no scaling)
+- `i32_bipolar`: `round((v * 2 - 1) * scale)` written as int32 LE.
+  `0.0 → -scale`, `0.5 → 0`, `1.0 → +scale`. **Most common 4-byte
+  encoding** for FL native knobs (verified on Reeverb 2 Stereo
+  separation scale=64, Limiter Comp ratio + knee scale=1000).
 
 For 4-byte slots discovered by the sweep tool (emitted as
-`u32-or-f32`), default to `f32` — FL's knob convention stores
-normalized [0,1] floats. Verify via FL round-trip before shipping;
-flip to `u32` if FL rejects the value.
+`u32-or-f32`), **probe FL first** — most are `i32_bipolar` with a
+plugin-specific scale. Set normalized values 0.0/0.5/1.0 via FL IPC,
+save, byte-diff at the offset:
+- 0.0 → all-negative-ones with high bit set, 0.5 → all zeros,
+  1.0 → small positive value → `i32_bipolar`, scale = abs(int32(0.0)).
+- 0.5 → `0x00 0x00 0x00 0x3F` → `f32`.
+- 0.5 → `0xFF 0xFF 0xFF 0x7F` → `u32`.
+
+See `python/tools/re_harness/sweep_plugin_layout.py` for the IPC
+driver pattern, and the per-plugin probe scripts in `/tmp/probe_*.py`
+for examples of the byte-classification step.
 
 For new plugins, use the generic `{kind:"param", index}` ref — the
 auto-sweep tool emits layouts in that shape.
@@ -180,8 +196,8 @@ Shipped:
 | Plugin | Status | Coverage |
 |---|---|---|
 | Fruity Parametric EQ 2 (both name variants) | ✅ F2.4 | structured refs (band/main_level) |
-| Fruity Reeverb 2 (both name variants) | ✅ via sweep | 15/15 params (Stereo separation = f32, **pending FL verify**) |
-| Fruity Limiter | ✅ via sweep | 18/18 params (Comp ratio + knee = f32, **pending FL verify**) |
+| Fruity Reeverb 2 (both name variants) | ✅ via sweep + i32_bipolar verify | 15/15 (Stereo separation = i32_bipolar scale=64, FL-verified) |
+| Fruity Limiter | ✅ via sweep + i32_bipolar verify | 18/18 (Comp ratio + knee = i32_bipolar scale=1000, FL-verified) |
 
 ## VST plugins explicitly out of scope
 

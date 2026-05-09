@@ -2105,7 +2105,16 @@ type PluginLayout = {
   maxSize: number;
   paramRefToOffset: (
     ref: PluginParamRef,
-  ) => { offset: number; fieldType: "u8" | "u16" | "u32" | "f32" } | null;
+  ) =>
+    | {
+        offset: number;
+        fieldType: "u8" | "u16" | "u32" | "f32" | "i32_bipolar";
+        /** Required when `fieldType === "i32_bipolar"`. The stored
+         *  int32 LE = `round((normalized * 2 - 1) * scale)` so that
+         *  `0.0 → -scale`, `0.5 → 0`, `1.0 → +scale`. */
+        scale?: number;
+      }
+    | null;
 };
 
 const EQ2_LAYOUT: PluginLayout = {
@@ -2145,9 +2154,9 @@ const EQ2_LAYOUT: PluginLayout = {
  * param touch grows it to canonical 66. minSize=66 here keeps the
  * encoder strict against half-formed blobs.
  *
- * Param 9 (Stereo separation) is a 4-byte slot at 0x28, mapped as
- * `f32` LE pending FL round-trip verification (flip to `u32` if
- * rejected).
+ * Param 9 (Stereo separation) is a 4-byte slot at 0x28, encoded as
+ * `i32_bipolar` LE with scale=64 (verified via FL round-trip
+ * 2026-05-09): 0.0 → -64, 0.5 → 0, 1.0 → +64.
  *
  * **Scale caveat (v1 limitation):** unlike EQ 2 which uniformly stores
  * params as `round(v * 0xFFFF)`, Reeverb 2 mixes encodings — some
@@ -2172,10 +2181,10 @@ const REEVERB2_LAYOUT: PluginLayout = {
     if (ref.index === 6) return { offset: 0x1c, fieldType: "u8" };  // High damping
     if (ref.index === 7) return { offset: 0x20, fieldType: "u16" }; // Bass multiplier
     if (ref.index === 8) return { offset: 0x24, fieldType: "u16" }; // Crossover
-    // Param 9 (Stereo separation) — 4-byte slot at 0x28, hypothesised
-    // f32 LE normalized [0,1] (FL knob convention). VERIFY via FL
-    // round-trip; flip to "u32" if rejected.
-    if (ref.index === 9) return { offset: 0x28, fieldType: "f32" }; // Stereo separation
+    // Param 9 (Stereo separation) — i32 LE bipolar, scale 64.
+    // 0.0 → -64, 0.5 → 0, 1.0 → +64. Verified via FL round-trip
+    // 2026-05-09 against synthesized fixture (h3_ys_64 donor).
+    if (ref.index === 9) return { offset: 0x28, fieldType: "i32_bipolar", scale: 64 }; // Stereo separation
     if (ref.index === 10) return { offset: 0x2c, fieldType: "u8" }; // Dry level
     if (ref.index === 11) return { offset: 0x30, fieldType: "u8" }; // Early reflection level
     if (ref.index === 12) return { offset: 0x34, fieldType: "u8" }; // Wet level
@@ -2194,10 +2203,9 @@ const REEVERB2_LAYOUT: PluginLayout = {
  * 169 bytes. minSize=169 (strict). maxSize=219 (50-byte tolerance for
  * future FL versions adding trailing state).
  *
- * Param 9 (Comp ratio) and param 10 (Comp knee) write 4 consecutive
- * bytes — currently mapped as `f32` LE on FL's knob-normalisation
- * convention (most internal knob params store [0,1] float). Pending
- * FL round-trip verification — flip to `u32` if rejected.
+ * Param 9 (Comp ratio) and param 10 (Comp knee) write 4 bytes each
+ * encoded as `i32_bipolar` LE with scale=1000 (verified via FL
+ * round-trip 2026-05-09): 0.0 → -1000, 0.5 → 0, 1.0 → +1000.
  * The other 16 params are u8/u16 LE and write cleanly via
  * `round(v * 0xFF)` / `round(v * 0xFFFF)`.
  */
@@ -2215,11 +2223,11 @@ const LIMITER_LAYOUT: PluginLayout = {
     if (ref.index === 6) return { offset: 0x1c, fieldType: "u8" };  // Limiter release curve
     if (ref.index === 7) return { offset: 0x20, fieldType: "u16" }; // Limiter peak window
     if (ref.index === 8) return { offset: 0x24, fieldType: "u16" }; // Comp threshold
-    // Params 9 (Comp ratio) + 10 (Comp knee) — 4-byte slots, hypothesised
-    // f32 LE normalized [0,1] (FL knob convention). VERIFY via FL
-    // round-trip; flip to "u32" if rejected.
-    if (ref.index === 9) return { offset: 0x28, fieldType: "f32" }; // Comp ratio
-    if (ref.index === 10) return { offset: 0x2c, fieldType: "f32" }; // Comp knee
+    // Params 9 (Comp ratio) + 10 (Comp knee) — i32 LE bipolar, scale
+    // 1000. 0.0 → -1000, 0.5 → 0, 1.0 → +1000. Verified via FL
+    // round-trip 2026-05-09 against /tmp/probe_limiter.flp.
+    if (ref.index === 9) return { offset: 0x28, fieldType: "i32_bipolar", scale: 1000 }; // Comp ratio
+    if (ref.index === 10) return { offset: 0x2c, fieldType: "i32_bipolar", scale: 1000 }; // Comp knee
     if (ref.index === 11) return { offset: 0x30, fieldType: "u16" }; // Comp attack time
     if (ref.index === 12) return { offset: 0x34, fieldType: "u16" }; // Comp release time
     if (ref.index === 13) return { offset: 0x38, fieldType: "u8" };  // Comp curve
@@ -2457,6 +2465,16 @@ export function setNativePluginParam(
   } else if (offsetInfo.fieldType === "f32") {
     const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
     view.setFloat32(off, normalizedValue, true);
+  } else if (offsetInfo.fieldType === "i32_bipolar") {
+    if (offsetInfo.scale === undefined || !Number.isFinite(offsetInfo.scale)) {
+      throw new MutationError(
+        "INVALID_ARGS",
+        `i32_bipolar fieldType requires numeric scale; got ${offsetInfo.scale}`,
+      );
+    }
+    const raw = Math.round((normalizedValue * 2 - 1) * offsetInfo.scale);
+    const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+    view.setInt32(off, raw, true);
   }
 
   const events = [...project.events];

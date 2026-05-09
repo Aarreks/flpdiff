@@ -1528,15 +1528,12 @@ describe("setNativePluginParam — Fruity Parametric EQ 2", () => {
 });
 
 // --------------------------------------------------------------------------- //
-// 4-byte field types (u32 / f32) — exercised through real plugin layouts     //
+// 4-byte field types (u32 / f32 / i32_bipolar) — exercised through real      //
+// plugin layouts (Reeverb 2 stereo separation, scale=64).                    //
 // --------------------------------------------------------------------------- //
 
-function readF32LE(buf: Uint8Array, offset: number): number {
-  return new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getFloat32(offset, true);
-}
-
-function readU32LE(buf: Uint8Array, offset: number): number {
-  return new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getUint32(offset, true);
+function readI32LE(buf: Uint8Array, offset: number): number {
+  return new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getInt32(offset, true);
 }
 
 function makeReeverb2Project(): FLPProject {
@@ -1563,8 +1560,8 @@ function makeReeverb2Project(): FLPProject {
   };
 }
 
-describe("setNativePluginParam — 4-byte field types", () => {
-  test("f32: writes IEEE-754 LE float at offset (Reeverb 2 stereo separation, idx 9)", () => {
+describe("setNativePluginParam — i32_bipolar field type", () => {
+  test("Reeverb 2 stereo separation (scale=64): 0.5 -> 0", () => {
     const project = makeReeverb2Project();
     const mutated = setNativePluginParam(
       project,
@@ -1574,38 +1571,51 @@ describe("setNativePluginParam — 4-byte field types", () => {
     );
     const ev = mutated.events[4]!;
     if (ev.kind !== "blob") throw new Error("expected blob");
-    expect(readF32LE(ev.payload, 0x28)).toBeCloseTo(0.5, 6);
-    // 0.5 as f32 LE = 0x00 0x00 0x00 0x3F
-    expect(ev.payload[0x28]).toBe(0x00);
-    expect(ev.payload[0x29]).toBe(0x00);
-    expect(ev.payload[0x2a]).toBe(0x00);
-    expect(ev.payload[0x2b]).toBe(0x3f);
+    expect(readI32LE(ev.payload, 0x28)).toBe(0);
   });
 
-  test("f32: writes 0.0 as 4 zero bytes", () => {
+  test("Reeverb 2 stereo separation: 0.0 -> -64", () => {
     const project = makeReeverb2Project();
     const mutated = setNativePluginParam(
       project,
       { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
       { kind: "param", index: 9 },
-      0,
+      0.0,
     );
     const ev = mutated.events[4]!;
     if (ev.kind !== "blob") throw new Error("expected blob");
-    expect(readU32LE(ev.payload, 0x28)).toBe(0);
+    expect(readI32LE(ev.payload, 0x28)).toBe(-64);
+    // -64 LE = c0 ff ff ff
+    expect(ev.payload[0x28]).toBe(0xc0);
+    expect(ev.payload[0x29]).toBe(0xff);
+    expect(ev.payload[0x2a]).toBe(0xff);
+    expect(ev.payload[0x2b]).toBe(0xff);
   });
 
-  test("f32: writes 1.0 as 0x3F800000 LE", () => {
+  test("Reeverb 2 stereo separation: 1.0 -> +64", () => {
     const project = makeReeverb2Project();
     const mutated = setNativePluginParam(
       project,
       { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
       { kind: "param", index: 9 },
-      1,
+      1.0,
     );
     const ev = mutated.events[4]!;
     if (ev.kind !== "blob") throw new Error("expected blob");
-    expect(readU32LE(ev.payload, 0x28)).toBe(0x3f800000);
+    expect(readI32LE(ev.payload, 0x28)).toBe(64);
+  });
+
+  test("Reeverb 2 stereo separation: 0.25 -> -32 (linear interp)", () => {
+    const project = makeReeverb2Project();
+    const mutated = setNativePluginParam(
+      project,
+      { kind: "mixer_slot", insertIndex: 1, slotIndex: 0 },
+      { kind: "param", index: 9 },
+      0.25,
+    );
+    const ev = mutated.events[4]!;
+    if (ev.kind !== "blob") throw new Error("expected blob");
+    expect(readI32LE(ev.payload, 0x28)).toBe(-32);
   });
 
   test("does not touch surrounding bytes (4-byte slot is bounded)", () => {
@@ -1618,7 +1628,6 @@ describe("setNativePluginParam — 4-byte field types", () => {
     );
     const ev = mutated.events[4]!;
     if (ev.kind !== "blob") throw new Error("expected blob");
-    // Bytes immediately before (0x27) and after (0x2c) must remain zero.
     expect(ev.payload[0x27]).toBe(0);
     expect(ev.payload[0x2c]).toBe(0);
   });
