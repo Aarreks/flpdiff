@@ -3004,3 +3004,64 @@ export function arrangeSong(
   }
   return next;
 }
+
+// --------------------------------------------------------------------------- //
+// F6.6 — Plugin instantiation (synthesis-best-effort, D-32 caveat)            //
+// --------------------------------------------------------------------------- //
+//
+// Wraps the existing `extractPluginSlotScope` + `craftPluginFixture`
+// synthesis path from src/synth/craft-plugin-fixture.ts as a regular
+// mutation, callable from the bridge. Limitations:
+// - Requires a donor FLPProject already containing the target plugin
+//   (we don't ship a donor pack yet; user provides via donor_path).
+// - FL UI recognition works for synthesized plugins; IPC binding works
+//   in the cases tested but may fail on others (R17 / D-32).
+// - Best-effort error: PLUGIN_INSTANTIATE_FAILED + which plugin tried.
+
+import { extractPluginSlotScope, craftPluginFixture } from "../synth/craft-plugin-fixture.ts";
+
+export type InstantiateScope =
+  | { kind: "mixer_slot"; insert_index: number; slot_marker: number };
+
+/**
+ * Splice a plugin from `donor` into `project` at the requested mixer
+ * slot. Returns the mutated project + the FL IPC slot index where
+ * the plugin will appear (= slot_marker + 1).
+ *
+ * Throws `PLUGIN_INSTANTIATE_FAILED` if extraction or splice fails.
+ */
+export function instantiateNativePlugin(
+  project: FLPProject,
+  donor: FLPProject,
+  pluginName: string,
+  scope: InstantiateScope,
+): { project: FLPProject; fl_ipc_slot_index: number } {
+  if (scope.kind !== "mixer_slot") {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `scope.kind must be 'mixer_slot' (channel scope not yet supported)`,
+    );
+  }
+  let extracted;
+  try {
+    extracted = extractPluginSlotScope(donor, pluginName);
+  } catch (err) {
+    throw new MutationError(
+      "PLUGIN_INSTANTIATE_FAILED",
+      `donor extraction for "${pluginName}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  let mutated;
+  try {
+    mutated = craftPluginFixture(project, extracted.scope, scope.insert_index, scope.slot_marker);
+  } catch (err) {
+    throw new MutationError(
+      "PLUGIN_INSTANTIATE_FAILED",
+      `splice into insert=${scope.insert_index} slot_marker=${scope.slot_marker}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return {
+    project: mutated,
+    fl_ipc_slot_index: scope.slot_marker + 1,
+  };
+}

@@ -63,7 +63,7 @@ export function extractPluginSlotScope(
   pluginName: string,
 ): { scope: FLPEvent[]; donorInsert: number; donorSlot: number } {
   let curInsert = 0;
-  let curSlot = -1;
+  let curSlot = 0; // FL omits 0x62 for the FIRST plugin in an insert; default to slot 0
   let inMixer = false;
   let candidateStart = -1;
   let candidateName: string | null = null;
@@ -72,6 +72,10 @@ export function extractPluginSlotScope(
     const ev = donor.events[i]!;
     if (ev.opcode === OP_INSERT_FLAGS) {
       inMixer = true;
+      // New insert opens — events that follow before any 0x62 belong to slot 0.
+      curSlot = 0;
+      candidateStart = i + 1;
+      candidateName = null;
       continue;
     }
     if (!inMixer) continue;
@@ -102,7 +106,7 @@ export function extractPluginSlotScope(
         };
       }
       curInsert++;
-      curSlot = -1;
+      curSlot = 0;
       candidateStart = -1;
       candidateName = null;
       continue;

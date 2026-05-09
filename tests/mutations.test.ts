@@ -42,6 +42,7 @@ import {
   setChannelVolume,
   setChannelPan,
   arrangeSong,
+  instantiateNativePlugin,
   MutationError,
 } from "../src/mutations/index.ts";
 import type { FLPProject } from "../src/parser/flp-project.ts";
@@ -2114,5 +2115,58 @@ describe("arrangeSong", () => {
       .sort((a, b) => a - b);
     expect(positions).toContain(0);
     expect(positions).toContain(576);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F6.6 — instantiateNativePlugin (synthesis-best-effort)                      //
+// --------------------------------------------------------------------------- //
+
+describe("instantiateNativePlugin", () => {
+  test("splices EQ 2 from a donor into the baseline", () => {
+    // Donor: base_one_insert.flp has Fruity Parametric EQ 2 at insert 1 slot 0
+    // Baseline: base_empty.flp (no plugins).
+    const donor = loadProject(join(import.meta.dir, "corpus/re_base/fl25/base_one_insert.flp"));
+    const baseline = loadProject(join(import.meta.dir, "corpus/re_base/fl25/base_empty.flp"));
+    const result = instantiateNativePlugin(
+      baseline,
+      donor,
+      "Fruity Parametric EQ 2",
+      { kind: "mixer_slot", insert_index: 0, slot_marker: 7 },
+    );
+    expect(result.fl_ipc_slot_index).toBe(8); // slot_marker + 1
+    // Re-parse, confirm new mixer slot has plugin.
+    const reparsed = reparse(result.project);
+    const masterInsert = reparsed.inserts[0]!;
+    const populated = masterInsert.slots.filter((s) => s.pluginName !== undefined);
+    expect(populated.length).toBeGreaterThanOrEqual(1);
+    const eq2 = populated.find((s) => s.pluginName === "Fruity Parametric EQ 2");
+    expect(eq2).toBeDefined();
+  });
+
+  test("PLUGIN_INSTANTIATE_FAILED when donor lacks the plugin", () => {
+    const donor = loadProject(join(import.meta.dir, "corpus/re_base/fl25/base_empty.flp"));
+    const baseline = loadProject(join(import.meta.dir, "corpus/re_base/fl25/base_empty.flp"));
+    expect(() =>
+      instantiateNativePlugin(
+        baseline,
+        donor,
+        "Fruity Limiter",
+        { kind: "mixer_slot", insert_index: 0, slot_marker: 7 },
+      ),
+    ).toThrow(/PLUGIN_INSTANTIATE_FAILED|not found/);
+  });
+
+  test("rejects channel scope (mixer_slot only in v1)", () => {
+    const donor = loadProject(join(import.meta.dir, "corpus/re_base/fl25/base_one_insert.flp"));
+    const baseline = loadProject(join(import.meta.dir, "corpus/re_base/fl25/base_empty.flp"));
+    expect(() =>
+      instantiateNativePlugin(
+        baseline,
+        donor,
+        "Fruity Parametric EQ 2",
+        { kind: "channel" } as never,
+      ),
+    ).toThrow(MutationError);
   });
 });

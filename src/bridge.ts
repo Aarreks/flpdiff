@@ -81,6 +81,7 @@ import {
   setChannelPan,
   arrangeSong,
   type SongSection,
+  instantiateNativePlugin,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -167,6 +168,8 @@ const WRITE_KINDS = new Set([
   "set_channel_pan",
   // Epic 6 / F6.5 — arrangement sequencing
   "arrange_song",
+  // Epic 6 / F6.6 — plugin instantiation (synthesis-best-effort)
+  "instantiate_native_plugin",
 ]);
 
 /**
@@ -446,6 +449,13 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
   set_channel_volume: new Set(["path", "iid", "value"]),
   set_channel_pan: new Set(["path", "iid", "value"]),
   arrange_song: new Set(["path", "arrangement", "structure", "track_index", "beats_per_bar"]),
+  instantiate_native_plugin: new Set([
+    "path",
+    "donor_path",
+    "plugin_name",
+    "insert_index",
+    "slot_marker",
+  ]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -1053,6 +1063,38 @@ function executeWrite(
         track_index: trackIndex,
         beats_per_bar: beatsPerBar,
       });
+    } else if (kind === "instantiate_native_plugin") {
+      const donorPath = String(args["donor_path"] ?? "");
+      const pluginName = String(args["plugin_name"] ?? "");
+      const insertIdx = Number(args["insert_index"] ?? 0);
+      const slotMarker = Number(args["slot_marker"] ?? 0);
+      if (!donorPath || !pluginName) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.donor_path + args.plugin_name required",
+        );
+      }
+      const donorBytes = readFileSync(resolve(donorPath));
+      const donor = parseFLPFile(donorBytes.buffer.slice(
+        donorBytes.byteOffset,
+        donorBytes.byteOffset + donorBytes.byteLength,
+      ));
+      const result = instantiateNativePlugin(project, donor, pluginName, {
+        kind: "mixer_slot",
+        insert_index: insertIdx,
+        slot_marker: slotMarker,
+      });
+      const bytes = serializeFLPProject(result.project);
+      writeFileSync(resolve(path), bytes);
+      return {
+        ok: true,
+        kind,
+        result: {
+          path: resolve(path),
+          bytes_written: bytes.byteLength,
+          fl_ipc_slot_index: result.fl_ipc_slot_index,
+        },
+      };
     } else if (kind === "create_channel") {
       const name = args["name"];
       const kindArg = args["kind"];
