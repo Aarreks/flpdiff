@@ -12,7 +12,7 @@ type PluginLayout = {
   minSize: number; // last param byte + 1; smaller blobs reject
   maxSize: number; // generous upper bound (rejects unrelated blobs)
   paramRefToOffset: (ref: PluginParamRef) =>
-    { offset: number; fieldType: "u8" | "u16" } | null;
+    { offset: number; fieldType: "u8" | "u16" | "u32" | "f32" } | null;
 };
 
 const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
@@ -25,8 +25,16 @@ const PLUGIN_PARAM_LAYOUTS: Record<string, PluginLayout> = {
 `paramRefToOffset` is the per-plugin function that maps an LLM-supplied
 `PluginParamRef` (one of `{kind:"main_level"}`, `{kind:"band", band, field}`,
 `{kind:"param", index}`) to a `(offset, fieldType)` pair. The encoder
-writes `round(value * 0xFFFF)` for `u16` slots and
-`round(value * 0xFF)` for `u8` slots, both LE.
+writes the normalized [0,1] value as:
+- `u8`: `round(v * 0xFF)`, 1 byte
+- `u16`: `round(v * 0xFFFF)`, 2 bytes LE
+- `u32`: `round(v * 0xFFFFFFFF)`, 4 bytes LE
+- `f32`: IEEE-754 single-precision, 4 bytes LE (raw `v`, no scaling)
+
+For 4-byte slots discovered by the sweep tool (emitted as
+`u32-or-f32`), default to `f32` — FL's knob convention stores
+normalized [0,1] floats. Verify via FL round-trip before shipping;
+flip to `u32` if FL rejects the value.
 
 For new plugins, use the generic `{kind:"param", index}` ref — the
 auto-sweep tool emits layouts in that shape.
@@ -172,8 +180,8 @@ Shipped:
 | Plugin | Status | Coverage |
 |---|---|---|
 | Fruity Parametric EQ 2 (both name variants) | ✅ F2.4 | structured refs (band/main_level) |
-| Fruity Reeverb 2 (both name variants) | ✅ via sweep | 14/15 params (Stereo separation = 4-byte slot, deferred) |
-| Fruity Limiter | ✅ via sweep | 16/18 params (Comp ratio + knee = 4-byte slots, deferred) |
+| Fruity Reeverb 2 (both name variants) | ✅ via sweep | 15/15 params (Stereo separation = f32, **pending FL verify**) |
+| Fruity Limiter | ✅ via sweep | 18/18 params (Comp ratio + knee = f32, **pending FL verify**) |
 
 ## VST plugins explicitly out of scope
 

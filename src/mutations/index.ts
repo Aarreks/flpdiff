@@ -2105,7 +2105,7 @@ type PluginLayout = {
   maxSize: number;
   paramRefToOffset: (
     ref: PluginParamRef,
-  ) => { offset: number; fieldType: "u8" | "u16" } | null;
+  ) => { offset: number; fieldType: "u8" | "u16" | "u32" | "f32" } | null;
 };
 
 const EQ2_LAYOUT: PluginLayout = {
@@ -2145,6 +2145,10 @@ const EQ2_LAYOUT: PluginLayout = {
  * param touch grows it to canonical 66. minSize=66 here keeps the
  * encoder strict against half-formed blobs.
  *
+ * Param 9 (Stereo separation) is a 4-byte slot at 0x28, mapped as
+ * `f32` LE pending FL round-trip verification (flip to `u32` if
+ * rejected).
+ *
  * **Scale caveat (v1 limitation):** unlike EQ 2 which uniformly stores
  * params as `round(v * 0xFFFF)`, Reeverb 2 mixes encodings — some
  * params (Bass multiplier, Crossover, Stereo separation) appear to be
@@ -2168,9 +2172,10 @@ const REEVERB2_LAYOUT: PluginLayout = {
     if (ref.index === 6) return { offset: 0x1c, fieldType: "u8" };  // High damping
     if (ref.index === 7) return { offset: 0x20, fieldType: "u16" }; // Bass multiplier
     if (ref.index === 8) return { offset: 0x24, fieldType: "u16" }; // Crossover
-    // Param 9 (Stereo separation) is a 4-byte slot at 0x28 — likely
-    // float32 LE or u32. Encoder doesn't support 4-byte writes yet;
-    // omit until field-type extended.
+    // Param 9 (Stereo separation) — 4-byte slot at 0x28, hypothesised
+    // f32 LE normalized [0,1] (FL knob convention). VERIFY via FL
+    // round-trip; flip to "u32" if rejected.
+    if (ref.index === 9) return { offset: 0x28, fieldType: "f32" }; // Stereo separation
     if (ref.index === 10) return { offset: 0x2c, fieldType: "u8" }; // Dry level
     if (ref.index === 11) return { offset: 0x30, fieldType: "u8" }; // Early reflection level
     if (ref.index === 12) return { offset: 0x34, fieldType: "u8" }; // Wet level
@@ -2190,9 +2195,11 @@ const REEVERB2_LAYOUT: PluginLayout = {
  * future FL versions adding trailing state).
  *
  * Param 9 (Comp ratio) and param 10 (Comp knee) write 4 consecutive
- * bytes — likely float32 LE. Encoder skips them until field-type
- * supports `u32` / `f32`. The other 16 params are u8/u16 LE and
- * write cleanly via `round(v * 0xFF)` / `round(v * 0xFFFF)`.
+ * bytes — currently mapped as `f32` LE on FL's knob-normalisation
+ * convention (most internal knob params store [0,1] float). Pending
+ * FL round-trip verification — flip to `u32` if rejected.
+ * The other 16 params are u8/u16 LE and write cleanly via
+ * `round(v * 0xFF)` / `round(v * 0xFFFF)`.
  */
 const LIMITER_LAYOUT: PluginLayout = {
   minSize: 169,
@@ -2208,8 +2215,11 @@ const LIMITER_LAYOUT: PluginLayout = {
     if (ref.index === 6) return { offset: 0x1c, fieldType: "u8" };  // Limiter release curve
     if (ref.index === 7) return { offset: 0x20, fieldType: "u16" }; // Limiter peak window
     if (ref.index === 8) return { offset: 0x24, fieldType: "u16" }; // Comp threshold
-    // Param 9 (Comp ratio, 4 bytes at 0x28) — u32 or float32, skipped.
-    // Param 10 (Comp knee, 4 bytes at 0x2c) — u32 or float32, skipped.
+    // Params 9 (Comp ratio) + 10 (Comp knee) — 4-byte slots, hypothesised
+    // f32 LE normalized [0,1] (FL knob convention). VERIFY via FL
+    // round-trip; flip to "u32" if rejected.
+    if (ref.index === 9) return { offset: 0x28, fieldType: "f32" }; // Comp ratio
+    if (ref.index === 10) return { offset: 0x2c, fieldType: "f32" }; // Comp knee
     if (ref.index === 11) return { offset: 0x30, fieldType: "u16" }; // Comp attack time
     if (ref.index === 12) return { offset: 0x34, fieldType: "u16" }; // Comp release time
     if (ref.index === 13) return { offset: 0x38, fieldType: "u8" };  // Comp curve
@@ -2432,13 +2442,21 @@ export function setNativePluginParam(
 
   // Patch a copy.
   const newPayload = new Uint8Array(ev.payload);
+  const off = offsetInfo.offset;
   if (offsetInfo.fieldType === "u16") {
     const raw = Math.round(normalizedValue * 0xffff);
-    newPayload[offsetInfo.offset] = raw & 0xff;
-    newPayload[offsetInfo.offset + 1] = (raw >> 8) & 0xff;
+    newPayload[off] = raw & 0xff;
+    newPayload[off + 1] = (raw >> 8) & 0xff;
   } else if (offsetInfo.fieldType === "u8") {
     const raw = Math.round(normalizedValue * 0xff);
-    newPayload[offsetInfo.offset] = raw & 0xff;
+    newPayload[off] = raw & 0xff;
+  } else if (offsetInfo.fieldType === "u32") {
+    // round(v * 0xFFFFFFFF) overflows JS bitwise ops; use DataView.
+    const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+    view.setUint32(off, Math.round(normalizedValue * 0xffffffff), true);
+  } else if (offsetInfo.fieldType === "f32") {
+    const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+    view.setFloat32(off, normalizedValue, true);
   }
 
   const events = [...project.events];
