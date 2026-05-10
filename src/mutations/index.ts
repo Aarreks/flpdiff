@@ -2000,6 +2000,48 @@ export function createPattern(
  *
  * Insertion point: just before the first `0x63` (arrangement opener).
  */
+/** Channel runtime data opcode (52-byte blob with envelope/voice
+ *  routing UIDs). Bytes 36 + 40 are channel-instance UIDs that must
+ *  be unique per channel — shared values cause FL to route notes
+ *  from multiple channels to the same physical voice (only last
+ *  note plays per channel). */
+const OP_PLUGIN_RUNTIME_DATA = 0xd4;
+
+/** Scan all 0xD4 events in channel scopes to find the max
+ *  field-9 (byte 36) and field-10 (byte 40) values. New channels
+ *  must use values strictly greater so their voice routing is
+ *  unique. */
+function scanChannelD4UidMaxes(
+  events: readonly FLPEvent[],
+): { maxF9: number; maxF10: number } {
+  let inChannel = false;
+  let maxF9 = 0;
+  let maxF10 = 0;
+  for (const ev of events) {
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) {
+      inChannel = true;
+      continue;
+    }
+    if (ev.opcode === OP_INSERT_FLAGS || ev.opcode === OP_INSERT_END) {
+      inChannel = false;
+      continue;
+    }
+    if (ev.kind === "u16" && ev.opcode === 0x63) {
+      inChannel = false;
+      continue;
+    }
+    if (!inChannel) continue;
+    if (ev.kind === "blob" && ev.opcode === OP_PLUGIN_RUNTIME_DATA && ev.payload.byteLength >= 44) {
+      const view = new DataView(ev.payload.buffer, ev.payload.byteOffset, ev.payload.byteLength);
+      const f9 = view.getUint32(36, true);
+      const f10 = view.getUint32(40, true);
+      if (f9 > maxF9) maxF9 = f9;
+      if (f10 > maxF10) maxF10 = f10;
+    }
+  }
+  return { maxF9, maxF10 };
+}
+
 /** Find the first existing channel scope (events between its 0x40 and
  *  the next 0x40/0xEC/0x93/0x63 boundary). Used as a template for
  *  createChannel — FL needs ~46 channel-scope events (envelope, LFO,
@@ -2066,10 +2108,20 @@ export function createChannel(
   // loads visually but plays silent + can crash FL on song playback.
   // Override: 0x40 iid, 0x15 kind byte (if mismatched), 0xCB name. Drop
   // 0xC4 sample_path (caller adds via setChannelSamplePath).
+  // Patch 0xD4 fields 9 + 10 to unique per-channel values (D-65b: FL
+  // uses these as voice-routing UIDs; shared values cause notes from
+  // multiple channels to fight for the same physical voice → only
+  // last note plays per channel).
   const template = findFirstChannelTemplateScope(project.events);
   const events = [...project.events];
 
   if (template !== null) {
+    // Scan existing 0xD4 blobs for max field-9/field-10 across all
+    // channels so the new channel gets a higher unique pair.
+    const { maxF9, maxF10 } = scanChannelD4UidMaxes(events);
+    const newF9 = maxF9 + 1;
+    const newF10 = maxF10 + 1;
+
     const cloned: FLPEvent[] = [];
     for (let i = template.startIdx; i < template.endIdx; i++) {
       const ev = events[i]!;
@@ -2088,6 +2140,23 @@ export function createChannel(
           kind: "blob",
           opcode: OP_NAME,
           payload: encodeUtf16LeNullTerminated(name),
+        });
+        continue;
+      }
+      // Patch 0xD4 voice-routing UIDs (fields 9 + 10 = bytes 36 + 40).
+      if (
+        ev.kind === "blob" &&
+        ev.opcode === OP_PLUGIN_RUNTIME_DATA &&
+        ev.payload.byteLength >= 44
+      ) {
+        const newPayload = new Uint8Array(ev.payload);
+        const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+        view.setUint32(36, newF9, true);
+        view.setUint32(40, newF10, true);
+        cloned.push({
+          kind: "blob",
+          opcode: OP_PLUGIN_RUNTIME_DATA,
+          payload: newPayload,
         });
         continue;
       }
