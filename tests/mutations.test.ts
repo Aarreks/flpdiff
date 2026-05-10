@@ -1270,6 +1270,50 @@ describe("createChannel", () => {
     expect(created?.kind).toBe("automation");
   });
 
+  test("template-clones full channel scope (D-65 / techno_loop_demo regression)", () => {
+    // Bug: createChannel emitted only [0x40, 0x15, 0xCB] (3 events).
+    // FL needs ~46 channel-scope events (envelope/LFO/filter/levels/
+    // polyphony defaults) for sample playback. Result: silent channels +
+    // FL crash on playlist play.
+    // Fix: clone first existing channel scope as template; override
+    // iid + name + kind; drop sample_path.
+    const project = loadProject(FIXTURE);
+    // Count template scope events (first existing channel scope).
+    let templateEventCount = 0;
+    let inFirstChannel = false;
+    for (const ev of project.events) {
+      if (ev.kind === "u16" && ev.opcode === 0x40) {
+        if (inFirstChannel) break;
+        inFirstChannel = true;
+        continue;
+      }
+      if (!inFirstChannel) continue;
+      if (ev.opcode === 0xec || ev.opcode === 0x93) break;
+      if (ev.kind === "u16" && ev.opcode === 0x63) break;
+      templateEventCount++;
+    }
+    expect(templateEventCount).toBeGreaterThanOrEqual(20); // healthy template
+
+    const { project: mutated, iid } = createChannel(project, { name: "Bass" });
+
+    // Walk new channel's scope; assert it has comparable event count.
+    let newScopeCount = 0;
+    let inNewChannel = false;
+    for (const ev of mutated.events) {
+      if (ev.kind === "u16" && ev.opcode === 0x40) {
+        if (inNewChannel) break;
+        if (ev.value === iid) inNewChannel = true;
+        continue;
+      }
+      if (!inNewChannel) continue;
+      if (ev.opcode === 0xec || ev.opcode === 0x93) break;
+      if (ev.kind === "u16" && ev.opcode === 0x63) break;
+      newScopeCount++;
+    }
+    // Allow ±2 events for kind/name override + sample_path drop.
+    expect(newScopeCount).toBeGreaterThanOrEqual(templateEventCount - 2);
+  });
+
   test("preserves existing channels", () => {
     const project = loadProject(FIXTURE);
     const beforeKick = project.channels.find((c) => c.name === "Kick");

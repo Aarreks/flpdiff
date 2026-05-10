@@ -2000,6 +2000,36 @@ export function createPattern(
  *
  * Insertion point: just before the first `0x63` (arrangement opener).
  */
+/** Find the first existing channel scope (events between its 0x40 and
+ *  the next 0x40/0xEC/0x93/0x63 boundary). Used as a template for
+ *  createChannel — FL needs ~46 channel-scope events (envelope, LFO,
+ *  filter, levels, polyphony defaults) for playback to work; emitting
+ *  the bare minimum produces a channel that loads but plays silent
+ *  notes (techno_loop_demo regression 2026-05-10). */
+function findFirstChannelTemplateScope(
+  events: readonly FLPEvent[],
+): { startIdx: number; endIdx: number } | null {
+  let start = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  for (let i = start + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) return { startIdx: start, endIdx: i };
+    if (ev.opcode === OP_INSERT_FLAGS || ev.opcode === OP_INSERT_END) {
+      return { startIdx: start, endIdx: i };
+    }
+    // 0x63 = arrangement opener — channel section ends here.
+    if (ev.kind === "u16" && ev.opcode === 0x63) return { startIdx: start, endIdx: i };
+  }
+  return { startIdx: start, endIdx: events.length };
+}
+
 export function createChannel(
   project: FLPProject,
   opts: { name?: string; kind?: ChannelKindInput } = {},
@@ -2029,6 +2059,77 @@ export function createChannel(
 
   const insertAt = findInsertionBeforeArrangements(project.events);
 
+  // Template-clone the first existing channel's full event scope (D-65,
+  // techno_loop_demo regression). FL requires ~46 channel-scope events
+  // (envelope/LFO/filter/levels/polyphony defaults) for sample playback
+  // to work — emitting only `[0x40, 0x15, 0xCB]` makes a channel that
+  // loads visually but plays silent + can crash FL on song playback.
+  // Override: 0x40 iid, 0x15 kind byte (if mismatched), 0xCB name. Drop
+  // 0xC4 sample_path (caller adds via setChannelSamplePath).
+  const template = findFirstChannelTemplateScope(project.events);
+  const events = [...project.events];
+
+  if (template !== null) {
+    const cloned: FLPEvent[] = [];
+    for (let i = template.startIdx; i < template.endIdx; i++) {
+      const ev = events[i]!;
+      // Skip the original 0x40 — we'll prepend our own with newIid.
+      if (i === template.startIdx) continue;
+      // Drop sample path; caller installs explicitly.
+      if (ev.kind === "blob" && ev.opcode === OP_CHANNEL_SAMPLE_PATH) continue;
+      // Override channel kind byte if present.
+      if (ev.kind === "u8" && ev.opcode === OP_CHANNEL_TYPE) {
+        cloned.push({ kind: "u8", opcode: OP_CHANNEL_TYPE, value: _CHANNEL_KIND_TO_BYTE[kind] });
+        continue;
+      }
+      // Override display name.
+      if (ev.kind === "blob" && ev.opcode === OP_NAME) {
+        cloned.push({
+          kind: "blob",
+          opcode: OP_NAME,
+          payload: encodeUtf16LeNullTerminated(name),
+        });
+        continue;
+      }
+      // Deep-copy blob payloads to avoid aliasing.
+      if (ev.kind === "blob") {
+        cloned.push({ kind: "blob", opcode: ev.opcode, payload: new Uint8Array(ev.payload) });
+        continue;
+      }
+      // Scalar events — shallow copy is fine.
+      cloned.push({ ...ev });
+    }
+    // Ensure required override events exist even if template lacked them.
+    let hasKind = false;
+    let hasName = false;
+    for (const ev of cloned) {
+      if (ev.kind === "u8" && ev.opcode === OP_CHANNEL_TYPE) hasKind = true;
+      if (ev.kind === "blob" && ev.opcode === OP_NAME) hasName = true;
+    }
+    const newEvents: FLPEvent[] = [
+      { kind: "u16", opcode: OP_NEW_CHANNEL, value: newIid },
+    ];
+    if (!hasKind) {
+      newEvents.push({
+        kind: "u8",
+        opcode: OP_CHANNEL_TYPE,
+        value: _CHANNEL_KIND_TO_BYTE[kind],
+      });
+    }
+    if (!hasName) {
+      newEvents.push({
+        kind: "blob",
+        opcode: OP_NAME,
+        payload: encodeUtf16LeNullTerminated(name),
+      });
+    }
+    newEvents.push(...cloned);
+    events.splice(insertAt, 0, ...newEvents);
+    return { project: { ...project, events }, iid: newIid };
+  }
+
+  // Fallback (no template channel exists — shouldn't happen on real FLPs):
+  // emit minimal scope. FL behavior on this is undefined.
   const newEvents: FLPEvent[] = [
     { kind: "u16", opcode: OP_NEW_CHANNEL, value: newIid },
     { kind: "u8", opcode: OP_CHANNEL_TYPE, value: _CHANNEL_KIND_TO_BYTE[kind] },
@@ -2038,10 +2139,6 @@ export function createChannel(
       payload: encodeUtf16LeNullTerminated(name),
     },
   ];
-
-  // For instrument kind, emit an empty plugin-internal-name slot so FL
-  // recognises the channel as a placeholder for a future plugin. Sampler
-  // doesn't need it.
   if (kind === "instrument") {
     newEvents.splice(2, 0, {
       kind: "blob",
@@ -2049,8 +2146,6 @@ export function createChannel(
       payload: encodeUtf16LeNullTerminated(""),
     });
   }
-
-  const events = [...project.events];
   events.splice(insertAt, 0, ...newEvents);
   return { project: { ...project, events }, iid: newIid };
 }
