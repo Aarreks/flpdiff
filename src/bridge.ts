@@ -260,7 +260,13 @@ function parseNoteArgs(args: Record<string, unknown>): Note {
     }
     return v;
   };
-  let flags = num("flags", false, 0);
+  // Default flags to 0x4000 — bit 14 marks "real piano roll note" in
+  // FL's serialization. Real FL-emitted notes always have this bit set;
+  // notes without it (flags=0) appear in channel rack step view but
+  // are invisible + uneditable in the piano roll (techno_loop_demo
+  // 2026-05-10 regression). Caller can override by passing flags
+  // explicitly.
+  let flags = num("flags", false, 0x4000);
   if (args["slide"] !== undefined) {
     if (typeof args["slide"] !== "boolean") {
       throw new MutationError("INVALID_ARGS", "args.slide must be boolean when provided");

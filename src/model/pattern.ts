@@ -9,6 +9,12 @@ export type Note = {
    * Raw flags bitmask. Kept faithful to FL's on-disk byte so we can
    * round-trip and detect future flag introductions. Known bits:
    *   - bit 3 (`1 << 3 = 0x08`) → slide note. See `slide` field.
+   *   - bit 14 (`1 << 14 = 0x4000`) → "real piano roll note". Real
+   *     FL-emitted notes always have this set. Notes without it
+   *     appear in the channel rack step view but are invisible +
+   *     uneditable in the piano roll. The bridge defaults flags to
+   *     0x4000 when the agent doesn't specify (techno_loop_demo
+   *     regression 2026-05-10).
    * Other bits are unassigned.
    */
   flags: number;
