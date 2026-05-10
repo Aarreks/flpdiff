@@ -2002,6 +2002,21 @@ describe("setChannelVolume", () => {
   test("rejects unknown channel iid", () => {
     expect(() => setChannelVolume(loadProject(FIXTURE), 999, 0.5)).toThrow(MutationError);
   });
+
+  test("auto-inserts default 0xDB for freshly-created channel without Levels event", () => {
+    // Regression: techno_loop_demo (2026-05-10) showed setChannelVolume
+    // failing on channels created via createChannel — they lack 0xDB.
+    // Encoder should now auto-insert defaults + then patch.
+    const project = loadProject(FIXTURE);
+    const { project: withChan, iid } = createChannel(project, { name: "Bass" });
+    // New channel has no Levels event; setChannelVolume must succeed anyway.
+    const mutated = setChannelVolume(withChan, iid, 0.5);
+    const reparsed = reparse(mutated);
+    const ch = reparsed.channels.find((c) => c.iid === iid)!;
+    expect(ch.levels).toBeDefined();
+    expect(ch.levels?.volume).toBe(6400);  // 0.5 * 12800
+    expect(ch.levels?.pan).toBe(6400);     // default center
+  });
 });
 
 describe("setChannelPan", () => {

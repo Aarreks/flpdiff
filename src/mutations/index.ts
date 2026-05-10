@@ -2840,10 +2840,27 @@ function findChannelLevelsEvent(
   return -1;
 }
 
+/** Build a 24-byte 0xDB Levels blob with FL's defaults: pan=6400 (raw,
+ *  display center), volume=10000 (raw, ~0.78 normalized), pitch_shift=0,
+ *  filter_mod_x=256, filter_mod_y=0, filter_type=0. Used when a freshly
+ *  created channel (via createChannel) has no Levels event yet. */
+function defaultChannelLevelsPayload(): Uint8Array {
+  const buf = new Uint8Array(24);
+  const view = new DataView(buf.buffer);
+  view.setInt32(0, 6400, true);   // pan
+  view.setUint32(4, 10000, true); // volume
+  view.setInt32(8, 0, true);      // pitch_shift
+  view.setUint32(12, 256, true);  // filter_mod_x
+  view.setUint32(16, 0, true);    // filter_mod_y
+  view.setUint32(20, 0, true);    // filter_type
+  return buf;
+}
+
 /** Patch one numeric field inside the 24-byte 0xDB Levels blob.
- *  Throws if no Levels event exists for the channel (FL emits one
- *  for every channel, so absence means the FLP is malformed or the
- *  iid doesn't exist). */
+ *  Auto-inserts a default 0xDB if the channel exists but has no Levels
+ *  event yet (e.g., freshly-created channels via createChannel — FL's
+ *  on-disk emission includes Levels by default but our minimal channel
+ *  creator omits it). Throws if the channel itself doesn't exist. */
 function patchChannelLevels(
   project: FLPProject,
   iid: number,
@@ -2852,14 +2869,31 @@ function patchChannelLevels(
   if (!Number.isInteger(iid) || iid < 0) {
     throw new MutationError("INVALID_ARGS", `channel iid must be a non-negative integer, got ${iid}`);
   }
-  const eventIdx = findChannelLevelsEvent(project.events, iid);
+  let events = [...project.events];
+  let eventIdx = findChannelLevelsEvent(events, iid);
   if (eventIdx < 0) {
-    throw new MutationError(
-      "EVENT_NOT_FOUND",
-      `no 0xDB Levels event found for channel iid=${iid}`,
-    );
+    // No Levels event — verify channel exists, then insert a default
+    // Levels blob right after the 0x40 NEW_CHANNEL opener.
+    let openIdx = -1;
+    for (let i = 0; i < events.length; i++) {
+      const ev = events[i]!;
+      if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL && ev.value === iid) {
+        openIdx = i;
+        break;
+      }
+    }
+    if (openIdx === -1) {
+      throw new MutationError("EVENT_NOT_FOUND", `no channel with iid=${iid} found`);
+    }
+    const defaultPayload = defaultChannelLevelsPayload();
+    events.splice(openIdx + 1, 0, {
+      kind: "blob",
+      opcode: OP_CHANNEL_LEVELS,
+      payload: defaultPayload,
+    });
+    eventIdx = openIdx + 1;
   }
-  const ev = project.events[eventIdx]!;
+  const ev = events[eventIdx]!;
   if (ev.kind !== "blob" || ev.payload.byteLength < 24) {
     throw new MutationError(
       "EVENT_NOT_FOUND",
@@ -2869,7 +2903,6 @@ function patchChannelLevels(
   const newPayload = new Uint8Array(ev.payload);
   const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
   patch(view);
-  const events = [...project.events];
   events[eventIdx] = { kind: "blob", opcode: OP_CHANNEL_LEVELS, payload: newPayload };
   return { ...project, events };
 }
