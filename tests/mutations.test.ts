@@ -866,6 +866,31 @@ describe("setPatternNotes", () => {
     setPatternNotes(project, 1, []);
     expect(project.patterns.find((p) => p.id === 1)!.notes.length).toBe(beforeCount);
   });
+
+  test("encodes notes sorted by position ascending (FL playback requirement)", () => {
+    // FL Studio writes pattern notes globally sorted by position. When notes
+    // stream backwards in position (e.g. appended per-channel), FL plays only
+    // the last note per channel even though piano roll renders all of them.
+    const project = loadProject(FIXTURE);
+    const unsorted = [
+      noteAt({ position: 192, channel_iid: 0, length: 48, key: 60 }),
+      noteAt({ position: 0, channel_iid: 0, length: 48, key: 60 }),
+      noteAt({ position: 96, channel_iid: 1, length: 48, key: 60 }),
+      noteAt({ position: 96, channel_iid: 0, length: 48, key: 60 }),
+      noteAt({ position: 0, channel_iid: 1, length: 48, key: 60 }),
+    ];
+    const mutated = setPatternNotes(project, 1, unsorted);
+    const reparsed = reparse(mutated);
+    const pattern = reparsed.patterns.find((p) => p.id === 1)!;
+    const seq = pattern.notes.map((n) => [n.position, n.channel_iid]);
+    expect(seq).toEqual([
+      [0, 0],
+      [0, 1],
+      [96, 0],
+      [96, 1],
+      [192, 0],
+    ]);
+  });
 });
 
 describe("removePatternNote", () => {

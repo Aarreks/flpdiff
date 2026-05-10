@@ -1515,9 +1515,17 @@ export function encodeNote(note: Note): Uint8Array {
 }
 
 function encodePatternNotes(notes: readonly Note[]): Uint8Array {
-  const out = new Uint8Array(notes.length * NOTE_RECORD_SIZE);
-  for (let i = 0; i < notes.length; i++) {
-    out.set(encodeNote(notes[i]!), i * NOTE_RECORD_SIZE);
+  // FL serializes pattern notes globally sorted by position ascending,
+  // with channel_iid as a stable tiebreaker. Streams that go backwards
+  // in position (e.g. notes appended per-channel) cause FL's playback
+  // engine to play only the last note per channel, even though the
+  // piano roll renders all notes correctly.
+  const sorted = [...notes].sort((a, b) =>
+    a.position !== b.position ? a.position - b.position : a.channel_iid - b.channel_iid,
+  );
+  const out = new Uint8Array(sorted.length * NOTE_RECORD_SIZE);
+  for (let i = 0; i < sorted.length; i++) {
+    out.set(encodeNote(sorted[i]!), i * NOTE_RECORD_SIZE);
   }
   return out;
 }
