@@ -43,6 +43,7 @@ import {
   setChannelPan,
   arrangeSong,
   instantiateNativePlugin,
+  setChannelSamplePath,
   MutationError,
 } from "../src/mutations/index.ts";
 import type { FLPProject } from "../src/parser/flp-project.ts";
@@ -2168,5 +2169,48 @@ describe("instantiateNativePlugin", () => {
         { kind: "channel" } as never,
       ),
     ).toThrow(MutationError);
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// F7.1 — setChannelSamplePath                                                 //
+// --------------------------------------------------------------------------- //
+
+describe("setChannelSamplePath", () => {
+  test("replaces existing 0xC4 in-place (Kick channel = iid 1 in baseline)", () => {
+    const project = loadProject(FIXTURE);
+    const newToken = "%FLStudioFactoryData%/Data/Patches/Packs/Drums/Kicks/707 Kick.wav";
+    const mutated = setChannelSamplePath(project, 1, newToken);
+    const reparsed = reparse(mutated);
+    const kick = reparsed.channels.find((c) => c.iid === 1);
+    expect(kick?.sample_path).toBe(newToken);
+  });
+
+  test("inserts 0xC4 when channel has none (Sampler iid=0 in baseline lacks sample_path)", () => {
+    const project = loadProject(FIXTURE);
+    const token = "%FLStudioFactoryData%/Data/Patches/Packs/Drums/Snares/707 Snare.wav";
+    const mutated = setChannelSamplePath(project, 0, token);
+    const reparsed = reparse(mutated);
+    const ch = reparsed.channels.find((c) => c.iid === 0);
+    expect(ch?.sample_path).toBe(token);
+  });
+
+  test("rejects unknown iid", () => {
+    expect(() =>
+      setChannelSamplePath(loadProject(FIXTURE), 999, "%FLStudioFactoryData%/x.wav"),
+    ).toThrow(MutationError);
+  });
+
+  test("rejects empty path", () => {
+    expect(() => setChannelSamplePath(loadProject(FIXTURE), 1, "")).toThrow(MutationError);
+  });
+
+  test("preserves all other channels untouched", () => {
+    const project = loadProject(FIXTURE);
+    const beforeSampler = reparse(project).channels.find((c) => c.iid === 0);
+    const mutated = setChannelSamplePath(project, 1, "%FLStudioFactoryData%/x.wav");
+    const afterSampler = reparse(mutated).channels.find((c) => c.iid === 0);
+    expect(afterSampler?.name).toBe(beforeSampler?.name);
+    expect(afterSampler?.sample_path).toBe(beforeSampler?.sample_path);
   });
 });

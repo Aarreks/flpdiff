@@ -82,6 +82,7 @@ import {
   arrangeSong,
   type SongSection,
   instantiateNativePlugin,
+  setChannelSamplePath,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -170,6 +171,8 @@ const WRITE_KINDS = new Set([
   "arrange_song",
   // Epic 6 / F6.6 — plugin instantiation (synthesis-best-effort)
   "instantiate_native_plugin",
+  // Epic 7 / F7.1 — sample-path setter
+  "set_channel_sample_path",
 ]);
 
 /**
@@ -456,6 +459,7 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "insert_index",
     "slot_marker",
   ]),
+  set_channel_sample_path: new Set(["path", "iid", "sample_path"]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -1063,6 +1067,16 @@ function executeWrite(
         track_index: trackIndex,
         beats_per_bar: beatsPerBar,
       });
+    } else if (kind === "set_channel_sample_path") {
+      const iid = Number(args["iid"]);
+      const samplePath = args["sample_path"];
+      if (!Number.isInteger(iid) || typeof samplePath !== "string") {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "iid (int) + sample_path (string, FL token form) required",
+        );
+      }
+      mutated = setChannelSamplePath(project, iid, samplePath);
     } else if (kind === "instantiate_native_plugin") {
       const donorPath = String(args["donor_path"] ?? "");
       const pluginName = String(args["plugin_name"] ?? "");

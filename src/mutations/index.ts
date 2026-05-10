@@ -3065,3 +3065,84 @@ export function instantiateNativePlugin(
     fl_ipc_slot_index: scope.slot_marker + 1,
   };
 }
+
+// --------------------------------------------------------------------------- //
+// F7.1 — Channel sample-path setter (0xC4)                                    //
+// --------------------------------------------------------------------------- //
+//
+// Sample channels store their loaded sample's path at opcode 0xC4 in
+// channel scope. Path uses FL's library-token form (e.g.
+// `%FLStudioFactoryData%/Data/Patches/Packs/Drums/Kicks/909 Kick.wav`)
+// — caller is responsible for token form; this encoder doesn't expand
+// or validate paths.
+
+const OP_CHANNEL_SAMPLE_PATH = 0xc4;
+
+/**
+ * Set (or replace) the sample path on a sampler channel. If the channel
+ * already has a 0xC4 event, replace it in-place; otherwise insert one
+ * immediately after the 0x40 channel-open.
+ *
+ * Throws `EVENT_NOT_FOUND` if the channel doesn't exist;
+ * `INVALID_ARGS` if path is empty / iid is bad.
+ */
+export function setChannelSamplePath(
+  project: FLPProject,
+  iid: number,
+  samplePath: string,
+): FLPProject {
+  if (!Number.isInteger(iid) || iid < 0) {
+    throw new MutationError(
+      "INVALID_ARGS",
+      `channel iid must be a non-negative integer, got ${iid}`,
+    );
+  }
+  if (typeof samplePath !== "string" || samplePath.length === 0) {
+    throw new MutationError("INVALID_ARGS", "samplePath must be a non-empty string");
+  }
+
+  const events = [...project.events];
+  const newPayload = encodeUtf16LeNullTerminated(samplePath);
+
+  let openIndex = -1;
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL && ev.value === iid) {
+      openIndex = i;
+      break;
+    }
+  }
+  if (openIndex === -1) {
+    throw new MutationError("EVENT_NOT_FOUND", `no channel with iid=${iid} found`);
+  }
+
+  // Bound to this channel's block (same boundary semantics as setChannelName).
+  let endIndex = events.length;
+  for (let i = openIndex + 1; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      (ev.kind === "u16" && ev.opcode === OP_NEW_CHANNEL) ||
+      (ev.kind === "u32" && ev.opcode === OP_INSERT_END) ||
+      (ev.kind === "blob" && ev.opcode === OP_INSERT_FLAGS)
+    ) {
+      endIndex = i;
+      break;
+    }
+  }
+
+  for (let i = openIndex + 1; i < endIndex; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_CHANNEL_SAMPLE_PATH) {
+      events[i] = { kind: "blob", opcode: OP_CHANNEL_SAMPLE_PATH, payload: newPayload };
+      return { ...project, events };
+    }
+  }
+
+  // No 0xC4 in scope — insert immediately after the 0x40 opener.
+  events.splice(openIndex + 1, 0, {
+    kind: "blob",
+    opcode: OP_CHANNEL_SAMPLE_PATH,
+    payload: newPayload,
+  });
+  return { ...project, events };
+}
