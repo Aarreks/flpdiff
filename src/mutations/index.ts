@@ -2007,6 +2007,35 @@ export function createPattern(
  *  note plays per channel). */
 const OP_PLUGIN_RUNTIME_DATA = 0xd4;
 
+/** Arrangement TrackData payload size — one 70-byte 0xEE per
+ *  playlist track row. First 4 bytes = channel UID binding (D-65c). */
+const TRACK_DATA_SIZE = 70;
+
+/** Walk events in-place to find the first 0xEE TrackData record
+ *  (70 bytes) whose first 4 bytes (u32@0 = channel UID binding)
+ *  are zero (= unused track). Patch them to `uid`. Mutates the
+ *  passed events array. Returns true on success. */
+function bindUidToFirstUnusedTrack(events: FLPEvent[], uid: number): boolean {
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i]!;
+    if (
+      ev.kind !== "blob" ||
+      ev.opcode !== OP_TRACK_DATA ||
+      ev.payload.byteLength !== TRACK_DATA_SIZE
+    ) {
+      continue;
+    }
+    const view = new DataView(ev.payload.buffer, ev.payload.byteOffset, ev.payload.byteLength);
+    if (view.getUint32(0, true) !== 0) continue;
+    const newPayload = new Uint8Array(ev.payload);
+    const w = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+    w.setUint32(0, uid, true);
+    events[i] = { kind: "blob", opcode: OP_TRACK_DATA, payload: newPayload };
+    return true;
+  }
+  return false;
+}
+
 /** Scan all 0xD4 events in channel scopes to find the max
  *  field-9 (byte 36) and field-10 (byte 40) values. New channels
  *  must use values strictly greater so their voice routing is
@@ -2194,6 +2223,13 @@ export function createChannel(
     }
     newEvents.push(...cloned);
     events.splice(insertAt, 0, ...newEvents);
+
+    // D-65c: bind newF9 UID to the first unused 0xEE TrackData (70B)
+    // record. Without this, FL has no playlist track that "owns" the
+    // new channel → notes route through whatever track happens to share
+    // the same UID, producing silence/wrong-voice playback.
+    bindUidToFirstUnusedTrack(events, newF9);
+
     return { project: { ...project, events }, iid: newIid };
   }
 
