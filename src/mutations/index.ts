@@ -1132,7 +1132,7 @@ export function setTrackGrouped(
 const OP_PLAYLIST = 0xe9;
 const PATTERN_BASE = 20480;
 const TRACK_MAX = 499;
-const CLIP_RECORD_SIZE = 60; // FL 21+ default; pre-FL-21 was 32
+const CLIP_RECORD_SIZE = 80; // FL 21+/25: 80-byte record. Pre-FL-21 was 32.
 
 export type ClipPlacement = {
   /** "pattern" → reference a pattern by id; "channel" → reference a channel by iid. */
@@ -1185,24 +1185,63 @@ function encodeClipRecord(
   itemIndex: number,
   length: number,
   trackRvidx: number,
+  clipId: number,
 ): Uint8Array {
-  // 60-byte FL 21+ record. Reserved bytes (_u1 16-17, _u2 20-23, _u3 32-59)
-  // stay zero — FL tolerates zero-reserved on freshly-written clips.
+  // 80-byte FL 21+/25 record. Verified against FL-saved fixture
+  // `/tmp/fl_truth_8clips.flp` (8 pattern clips × 80 bytes = 640).
+  //
+  // Layout:
+  //   0-3   position (u32)
+  //   4-5   pattern_base sentinel (20480)
+  //   6-7   item_index (pattern ref + PATTERN_BASE, or audio sample index)
+  //   8-11  length (u32, in PPQN ticks)
+  //   12-13 track_rvidx (max_track - track_index)
+  //   14-15 group (u16, 0 if ungrouped)
+  //   16-17 _u1 — always 120 (0x78 0x00)
+  //   18-19 item_flags — always 0x0040 (high byte 0x80 marks selected/muted)
+  //   20-23 _u2 — always bytes (64, 100, 128, 128)
+  //   24-27 start_offset (NaN/0xFFFFFFFF for pattern clips, -1.0f for audio)
+  //   28-31 end_offset (NaN/0xFFFFFFFF for pattern clips, -1.0f for audio)
+  //   32-35 clip id (u32, per-arrangement sequential)
+  //   36-63 zero (28 bytes)
+  //   64-71 scale (f64 1.0 → 0x3ff0000000000000 LE)
+  //   72-79 zero (8 bytes)
   const buf = new Uint8Array(CLIP_RECORD_SIZE);
   const view = new DataView(buf.buffer);
   view.setUint32(0, position, true);
-  view.setUint16(4, PATTERN_BASE, true); // pattern_base sentinel
+  view.setUint16(4, PATTERN_BASE, true);
   view.setUint16(6, itemIndex, true);
   view.setUint32(8, length, true);
   view.setUint16(12, trackRvidx, true);
-  view.setUint16(14, 0, true); // group
-  // 16-17 reserved
-  view.setUint16(18, 0, true); // item_flags — default
-  // 20-23 reserved
-  view.setFloat32(24, 0.0, true); // start_offset
-  view.setFloat32(28, 0.0, true); // end_offset
-  // 32-59 reserved (FL 21+)
+  view.setUint16(14, 0, true);
+  view.setUint16(16, 120, true);
+  view.setUint16(18, 64, true);
+  buf[20] = 64;
+  buf[21] = 100;
+  buf[22] = 128;
+  buf[23] = 128;
+  buf[24] = buf[25] = buf[26] = buf[27] = 0xff;
+  buf[28] = buf[29] = buf[30] = buf[31] = 0xff;
+  view.setUint32(32, clipId, true);
+  view.setFloat64(64, 1.0, true);
   return buf;
+}
+
+
+/**
+ * Scan a 0xE9 playlist payload for the maximum existing clip id (u32 at
+ * each record's +32 offset). Returns 0 for empty payloads. Caller adds
+ * 1 to get the next available id.
+ */
+function maxClipId(payload: Uint8Array): number {
+  if (payload.byteLength === 0 || payload.byteLength % CLIP_RECORD_SIZE !== 0) return 0;
+  const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+  let max = 0;
+  for (let p = 0; p + CLIP_RECORD_SIZE <= payload.byteLength; p += CLIP_RECORD_SIZE) {
+    const id = view.getUint32(p + 32, true);
+    if (id > max) max = id;
+  }
+  return max;
 }
 
 function resolveItemIndex(placement: ClipPlacement): number {
@@ -1254,24 +1293,31 @@ export function addClip(
   }
   const itemIndex = resolveItemIndex(placement);
   const trackRvidx = resolveTrackRvidx(placement.track_index);
+
+  const events = [...project.events];
+  const { openIdx, endIdx } = findArrangementBounds(events, arrangementId);
+
+  // Find LAST 0xE9 in arrangement scope + max clip id across ALL 0xE9
+  // blobs in this arrangement (so clip ids stay unique even if FL split
+  // the playlist into multiple consecutive 0xE9 events).
+  let lastBlobIdx = -1;
+  let maxId = 0;
+  for (let i = openIdx + 1; i < endIdx; i++) {
+    const ev = events[i]!;
+    if (ev.kind === "blob" && ev.opcode === OP_PLAYLIST) {
+      lastBlobIdx = i;
+      const id = maxClipId(ev.payload);
+      if (id > maxId) maxId = id;
+    }
+  }
+  const nextClipId = maxId + 1;
   const newRecord = encodeClipRecord(
     placement.position_ticks,
     itemIndex,
     placement.length_ticks,
     trackRvidx,
+    nextClipId,
   );
-
-  const events = [...project.events];
-  const { openIdx, endIdx } = findArrangementBounds(events, arrangementId);
-
-  // Find LAST 0xE9 in arrangement scope.
-  let lastBlobIdx = -1;
-  for (let i = openIdx + 1; i < endIdx; i++) {
-    const ev = events[i]!;
-    if (ev.kind === "blob" && ev.opcode === OP_PLAYLIST) {
-      lastBlobIdx = i;
-    }
-  }
 
   if (lastBlobIdx === -1) {
     // No playlist blob yet — insert one before the next arrangement
@@ -1340,7 +1386,13 @@ export function removeClip(
     const ev = events[i]!;
     if (ev.kind !== "blob" || ev.opcode !== OP_PLAYLIST) continue;
     const recordSize =
-      ev.payload.byteLength % 60 === 0 ? 60 : ev.payload.byteLength % 32 === 0 ? 32 : 0;
+      ev.payload.byteLength % 80 === 0
+        ? 80
+        : ev.payload.byteLength % 60 === 0
+          ? 60
+          : ev.payload.byteLength % 32 === 0
+            ? 32
+            : 0;
     if (recordSize === 0) continue;
     const view = new DataView(
       ev.payload.buffer,
@@ -1414,7 +1466,13 @@ export function moveClip(
     const ev = events[i]!;
     if (ev.kind !== "blob" || ev.opcode !== OP_PLAYLIST) continue;
     const recordSize =
-      ev.payload.byteLength % 60 === 0 ? 60 : ev.payload.byteLength % 32 === 0 ? 32 : 0;
+      ev.payload.byteLength % 80 === 0
+        ? 80
+        : ev.payload.byteLength % 60 === 0
+          ? 60
+          : ev.payload.byteLength % 32 === 0
+            ? 32
+            : 0;
     if (recordSize === 0) continue;
     const newPayload = new Uint8Array(ev.payload);
     const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);

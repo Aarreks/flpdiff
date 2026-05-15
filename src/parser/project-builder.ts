@@ -407,6 +407,20 @@ function isLegacyText(meta: ProjectMetadata | undefined): boolean {
   return v.major < 11 || (v.major === 11 && v.minor < 5);
 }
 
+/**
+ * FL 25.x writes 80-byte clip records inside opcode 0xE9. FL 21–24.x
+ * writes 60-byte records, pre-FL-21 writes 32-byte. Pick by major.
+ * Returns undefined to let decodeClips auto-detect when version is
+ * missing.
+ */
+function clipRecordSizeFor(meta: ProjectMetadata | undefined): number | undefined {
+  const v = meta?.version;
+  if (!v) return undefined;
+  if (v.major >= 25) return 80;
+  if (v.major >= 21) return 60;
+  return 32;
+}
+
 function decodeTextEvent(payload: Uint8Array, legacy: boolean): string {
   if (legacy) return decodeUtf8Bytes(payload);
   return decodeUtf16LeBytes(payload);
@@ -994,6 +1008,7 @@ export function buildArrangements(
   const legacy = isLegacyText(metadata);
   const channelIids = new Set(channels.map((c) => c.iid));
   const patternIds = new Set(patterns.map((p) => p.id));
+  const clipRecordSize = clipRecordSizeFor(metadata);
 
   const keepClip = (clip: { item_index: number; track_rvidx: number }): boolean => {
     if (clip.track_rvidx > PLAYLIST_MAX_TRACK_IDX) return false;
@@ -1045,7 +1060,7 @@ export function buildArrangements(
       continue;
     }
     if (ev.opcode === OP_PLAYLIST && ev.kind === "blob") {
-      for (const clip of decodeClips(ev.payload)) {
+      for (const clip of decodeClips(ev.payload, clipRecordSize)) {
         if (keepClip(clip)) current.clips.push(clip);
       }
       continue;

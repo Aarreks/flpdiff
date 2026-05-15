@@ -103,13 +103,13 @@ describe("decodeClips — binary-format unit tests (crafted payloads)", () => {
     expect(decodeClips(new Uint8Array(0))).toEqual([]);
   });
 
-  test("payload size not a multiple of 60 or 32 → empty array", () => {
+  test("payload size not a multiple of 80 or 32 → empty array", () => {
     expect(decodeClips(new Uint8Array(37))).toEqual([]);
-    expect(decodeClips(new Uint8Array(59))).toEqual([]);
+    expect(decodeClips(new Uint8Array(79))).toEqual([]);
   });
 
-  test("60-byte record (FL 21+) decodes all core fields", () => {
-    const buf = new Uint8Array(60);
+  test("80-byte record (FL 21+/25) decodes all core fields", () => {
+    const buf = new Uint8Array(80);
     const view = new DataView(buf.buffer);
     view.setUint32(0, 96, true); // position = 96 ticks
     view.setUint16(4, 20480, true); // pattern_base (ignored)
@@ -135,11 +135,11 @@ describe("decodeClips — binary-format unit tests (crafted payloads)", () => {
     });
   });
 
-  test("two 60-byte records decode in order", () => {
-    const buf = new Uint8Array(120);
+  test("two 80-byte records decode in order", () => {
+    const buf = new Uint8Array(160);
     const view = new DataView(buf.buffer);
     view.setUint32(0, 0, true);
-    view.setUint32(60, 480, true);
+    view.setUint32(80, 480, true);
     const clips = decodeClips(buf);
     expect(clips.length).toBe(2);
     expect(clips[0]!.position).toBe(0);

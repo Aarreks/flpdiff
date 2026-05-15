@@ -9,8 +9,8 @@ import type { RGBA } from "./channel.ts";
  * One playlist clip within an arrangement. Mirrors FL's on-disk record
  * shape as emitted inside the `0xE9` arrangement-playlist blob.
  *
- * FL 21+ uses a 60-byte record per clip; earlier FL versions used 32
- * bytes. The decoder auto-detects format by payload-size divisibility.
+ * FL 21+/25 uses an 80-byte record per clip; earlier FL versions used
+ * 32 bytes. The decoder auto-detects format by payload-size divisibility.
  */
 export type Clip = {
   /** Tick position on the arrangement timeline (PPQ ticks). */
@@ -32,13 +32,31 @@ export type Clip = {
 };
 
 /**
- * Decode arrangement clips from a `0xE9` payload. Handles both FL 21+
- * (60-byte records, "new" format) and earlier (32-byte records) layouts
- * via size-divisibility auto-detection. Returns an empty array for
- * malformed payloads.
+ * Decode arrangement clips from a `0xE9` payload.
+ *
+ * Three record sizes coexist in the wild:
+ *   80 — FL 25.x (current)
+ *   60 — FL 21.0 – 24.x
+ *   32 — pre-FL-21
+ *
+ * Sizes 60 and 80 are co-divisible at multiples of 240, so for
+ * unambiguous detection callers pass the FL major version via
+ * `preferredRecordSize`. Without it we try 80 first (covers FL 25.x
+ * truth-saved fixtures), then 60, then 32.
+ *
+ * Returns an empty array for malformed payloads.
  */
-export function decodeClips(payload: Uint8Array): Clip[] {
-  const recordSize = payload.byteLength % 60 === 0 ? 60 : payload.byteLength % 32 === 0 ? 32 : 0;
+export function decodeClips(payload: Uint8Array, preferredRecordSize?: number): Clip[] {
+  let recordSize = 0;
+  if (preferredRecordSize !== undefined && payload.byteLength % preferredRecordSize === 0) {
+    recordSize = preferredRecordSize;
+  } else if (payload.byteLength % 80 === 0) {
+    recordSize = 80;
+  } else if (payload.byteLength % 60 === 0) {
+    recordSize = 60;
+  } else if (payload.byteLength % 32 === 0) {
+    recordSize = 32;
+  }
   if (recordSize === 0 || payload.byteLength === 0) return [];
   const out: Clip[] = [];
   const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
