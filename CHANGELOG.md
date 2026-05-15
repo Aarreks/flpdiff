@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `0xE9` playlist clip-record size on FL 25.x is **80 bytes**, not
+  60. The previous 60-byte assumption (correct for FL 21–24.x) made
+  `addClip` emit malformed records that FL parsed with the wrong
+  stride — playlist clips rendered with zero length and FL crashed
+  on playback. Decoder (`decodeClips`) and parser
+  (`buildArrangements`) are now version-aware via
+  `clipRecordSizeFor(meta.version.major)`; encoder
+  (`encodeClipRecord`) writes 80-byte records unconditionally
+  (v1 targets FL 25 only). `removeClip` / `moveClip` accept
+  80 / 60 / 32 record sizes so older corpora keep round-tripping
+  for read-only diffs.
+- Pattern notes (`0xE0`) inside `setPatternNotes` are now sorted
+  by position then channel before encoding. FL's renderer plays
+  only the last note per channel when the position stream goes
+  backwards — multi-channel drum patterns (kick on iid=0, snare
+  on iid=1, hat on iid=2) were silently losing every note but the
+  last when notes were appended per-channel.
+
 ## [0.1.2] — 2026-04-27
 
 ### Fixed

@@ -136,7 +136,7 @@ output on all five FL 25 public fixtures.
 | `0x63` | WORD (u16 LE) | Arrangement identity marker | Arrangement id (uint16) | Announces a new playlist arrangement. FL 25 base projects have exactly one with id=0. Subsequent arrangement-scoped events (name, track descriptors) belong to the most-recently-announced arrangement. |
 | `0xC1` | DATA (varint + bytes) | Pattern name | Null-terminated UTF-16LE | User-set pattern name (e.g. `"P1"`). Absent for unnamed patterns. Scoped to the pattern id most recently announced by `0x41`. |
 | `0xC9` | DATA (varint + bytes) | Plugin internal class name | Null-terminated UTF-16LE | FL's identifier for the plugin's wrapper class. For native plugins (e.g. mixer-slot Fruity EQ 2) this matches the display name. For VST-wrapped channel-hosted plugins the payload is `"Fruity Wrapper"` (generic FL VST host); the real VST name (`"Serum"`, etc.) lives inside the `0xD5` plugin-state blob — see below. Sampler channels emit an empty `0xC9` as a placeholder — walkers should treat zero-length payloads as "no plugin". |
-| `0xE9` | DATA (varint + bytes) | Arrangement playlist clips | Dense array of 60-byte records (FL 21+) or 32-byte records (earlier) | **Simply absent when the arrangement has no clips** — the empty-playlist case produces no event rather than a zero-record blob. Each FL 21+ record: `uint32 position`, `uint16 pattern_base` (always 20480), `uint16 item_index`, `uint32 length`, `uint16 track_rvidx` (stored reversed), `uint16 group`, 2 reserved bytes, `uint16 item_flags`, 4 reserved bytes, `float32 start_offset`, `float32 end_offset`, 28 trailing reserved bytes. TS parser previously had `0xD9` hard-coded (wrong); the parity harness on `tests/corpus/local/` surfaced it. |
+| `0xE9` | DATA (varint + bytes) | Arrangement playlist clips | Dense array of 80-byte records (FL 25.x), 60-byte records (FL 21.0 – 24.x), or 32-byte records (pre-FL-21) | **Simply absent when the arrangement has no clips** — the empty-playlist case produces no event rather than a zero-record blob. Each FL 25 record: `uint32 position`, `uint16 pattern_base` (always 20480), `uint16 item_index`, `uint32 length`, `uint16 track_rvidx` (stored reversed), `uint16 group`, `uint16 _u1` (always 120), `uint16 item_flags` (always 0x0040; high byte 0x80 = selected), 4 bytes `_u2` (always `40 64 80 80`), `float32 start_offset` (NaN/0xFFFFFFFF for pattern clips, -1.0f for audio), `float32 end_offset` (same), `uint32 clip_id` (per-arrangement sequential, unique), 28 reserved zero bytes, `float64 scale` (1.0 at offset 64), 8 trailing zero bytes. FL 21–24.x layout matches bytes 0–35 then ends; FL 24-and-earlier `_u3` region was only 28 bytes (total 60). Three formats coexist; decoder picks size from FL major version (≥25 → 80, ≥21 → 60, else 32) since 80 and 60 are co-divisible at multiples of 240. Wrong size = FL parses misaligned, displays zero-length clips, crashes on playback (fixed in mutations 67c618a; truth fixture: FL 25.2.5 hand-saved). TS parser previously had `0xD9` hard-coded (wrong); the parity harness on `tests/corpus/local/` surfaced it. |
 | `0xDB` | DATA (varint + bytes) | Channel Levels struct | 24-byte fixed record | One per channel on FL 25 (pre-FL-25 saves emit Levels at `0xCB`, but `0xCB` is taken by Name; FL 25 relocates Levels to `0xDB`). Fields: `int32 pan`, `uint32 volume`, `int32 pitch_shift`, `uint32 filter_mod_x`, `uint32 filter_mod_y`, `uint32 filter_type`. Default values `{pan: 6400, volume: 10000, pitch_shift: 0, filter_mod_x: 256, filter_mod_y: 0, filter_type: 0}` — Python's `flp-info` exposes these as normalized floats `volume/12800 = 0.78125` and `pan/6400 = 1.0`. |
 | `0xD5` | DATA (varint + bytes) | Plugin state blob | Plugin-specific binary | For **VST-wrapped** plugins (internalName `"Fruity Wrapper"`) the payload is the FL VST-wrapper record stream: 4-byte `type` header (first byte = FL serialization marker, one of 6/8/9/10/11/12), then repeating `{uint32 id, uint64 len, N bytes data}` records. Relevant record ids: 54=Name (UTF-8), 56=Vendor (UTF-8), 55=PluginPath, 51=FourCC, 52=GUID, 53=State (opaque preset data). For **native** FL plugins (e.g. Fruity Parametric EQ 2) the payload is plugin-specific state — the VST-wrapper record format does not apply; decode per-plugin. |
 | `0xE0` | DATA (varint + bytes) | Pattern notes (FL 25) | Dense array of 24-byte records | FL 25 emits pattern notes at `0xE0`; pre-FL-25 saves emit them at `0xD0` (another FL 25 +16 relocation, also seen with track data). Each record: `uint32 position`, `uint16 flags`, `uint16 rack_channel`, `uint32 length`, `uint16 key`, `uint16 group`, `uint8 fine_pitch`, `uint8 _reserved`, `uint8 release`, `uint8 midi_channel`, `uint8 pan`, `uint8 velocity`, `uint8 mod_x`, `uint8 mod_y`. All lengths in PPQ ticks. |
@@ -361,6 +361,22 @@ Future additions to this spec should follow the same pattern:
   real-corpus run found every local FL 21+ file reporting
   `clips_total=0`. Fix: single-byte constant change in
   `project-builder.ts`.
+- **2026-05-15** — `0xE9` record size is **80 bytes on FL 25.x**,
+  not 60. The previous 60-byte assumption (derived from FL 24
+  saves in `tests/corpus/local/`) held for read-only parity but
+  caused playlist-clip generation via `addClip` to render
+  zero-length clips and crash FL on playback. Truth fixture
+  `/tmp/fl_truth_8clips.flp` (FL 25.2.5 hand-saved with 8 pattern
+  clips on 2 tracks) gives 640 bytes / 8 = 80 bytes per record.
+  The extra 20 bytes vs FL 24: trailing zero-padded region grows
+  from 28 to 48, and the `1.0` scale field is a `float64` at
+  offset 64 (FL 24 had it as `float32` somewhere in the smaller
+  tail). Decoder + encoder now version-aware:
+  `clipRecordSizeFor(meta.version.major)` returns 80/60/32 and
+  `decodeClips(payload, preferredRecordSize)` threads it through.
+  Auto-detect tries 80 → 60 → 32 when version is missing.
+  Disambiguation matters at sizes divisible by both 60 and 80
+  (multiples of 240). Fix: `flpdiff 67c618a`.
 - **2026-04-19** (later still) — Added `0xE0` pattern notes
   decoder. First musical-content primitive the parser decodes.
   24-byte fixed-record stream; each record is a full Note

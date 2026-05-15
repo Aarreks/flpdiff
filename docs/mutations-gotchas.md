@@ -303,3 +303,35 @@ combined blob — because:
 
 Either approach round-trips. The coalesce strategy makes byte-diff
 tooling honest about what changed.
+
+## 13. `0xE9` playlist clip record size depends on FL major version
+
+FL 25.x writes **80-byte** clip records inside `0xE9`. FL 21.0 – 24.x
+writes **60-byte**. Pre-FL-21 writes **32-byte**. All three coexist
+in the wild and the sizes are co-divisible at multiples of 240 — a
+240-byte payload could be three 80-byte records or four 60-byte
+records or seven 32-byte records (well, almost). Auto-detect by
+remainder alone is ambiguous.
+
+The decoder is version-aware: `decodeClips(payload, preferredRecordSize)`
+takes a hint from `clipRecordSizeFor(meta.version.major)` in the
+project builder — major ≥ 25 → 80, ≥ 21 → 60, else 32. Auto-detect
+(`undefined` hint) walks 80 → 60 → 32 in that order, which is right
+for FL 25 truth fixtures but will silently misparse a 240-byte FL 24
+payload as three (garbage) 80-byte records. **Always pass the hint
+when version is known.**
+
+The encoder always writes 80-byte records. Round-tripping a FL 24
+file through `addClip` will mix 60-byte (existing) and 80-byte (new)
+records into the same `0xE9` blob — the blob will then have a length
+that's neither cleanly divisible by 60 nor 80. FL will reject it.
+For FL-24 round-trips, either: (a) rewrite ALL records to 80-byte
+before appending (re-emit the whole blob), or (b) skip `addClip` on
+FL 24 inputs and direct users to re-save in FL 25 first. v1 only
+guarantees FL 25.
+
+Symptom of mismatched record size: clips display with zero length
+on the playlist, OR FL crashes immediately on playback. Verified
+in the wild on `house_song_demo_v1..v4.flp` (encoder bug) and
+caught by the FL-saved truth fixture `/tmp/fl_truth_8clips.flp`
+(2026-05-15, fixed in `flpdiff 67c618a`).
