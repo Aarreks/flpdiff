@@ -3318,6 +3318,7 @@ export function arrangeSong(
 // - Best-effort error: PLUGIN_INSTANTIATE_FAILED + which plugin tried.
 
 import { extractPluginSlotScope, craftPluginFixture } from "../synth/craft-plugin-fixture.ts";
+import { extractPluginScopeFromFst, FstParseError } from "../synth/extract-fst.ts";
 
 export type InstantiateScope =
   | { kind: "mixer_slot"; insert_index: number; slot_marker: number };
@@ -3362,6 +3363,178 @@ export function instantiateNativePlugin(
   return {
     project: mutated,
     fl_ipc_slot_index: scope.slot_marker + 1,
+  };
+}
+
+// --------------------------------------------------------------------------- //
+// F9.2 — Native plugin preset splice (.fst donors)                            //
+// --------------------------------------------------------------------------- //
+//
+// `.fst` files are FL Studio plugin presets — same FLhd/FLdt container as
+// `.flp` projects but with container_kind=0x0030 ("channel preset") and an
+// event stream that's just the plugin's channel-scope events
+// (0xC9 + 0xD4 + 0xD5 + optional channel decoration). See
+// `flpdiff/src/synth/extract-fst.ts` for the on-disk RE.
+//
+// Generators and effects share the same `.fst` container; the difference is
+// only in where they splice into the target FLP:
+//   - Generator preset → new top-level channel (channel rack entry)
+//   - Effect preset    → mixer slot (reuses F6.6 craftPluginFixture)
+//
+// The caller (typically the MCP manifest in preset_browser.py) classifies
+// presets by source directory and chooses which helper to call.
+
+/**
+ * Splice a generator preset (`.fst`) into `project` as a new top-level
+ * channel. Returns the mutated project + the freshly-assigned channel iid.
+ *
+ * Wrapping injected:
+ *   - `0x40 newIid` channel-opener
+ *   - `0x15 kind=1` (instrument) — only if donor doesn't already carry one
+ *   - `0xCB name` — caller-supplied or donor display name; only injected if
+ *     the donor doesn't already carry a `0xCB`
+ *
+ * Donor scope is patched:
+ *   - `0xD4` voice-routing UIDs at bytes 36/40 are bumped above target's
+ *     existing maxes (D-65b). Without this, FL routes notes from multiple
+ *     channels through the same physical voice and only the last note plays.
+ *   - The new UID is bound to the first unused `0xEE TrackData` record so
+ *     playlist tracks can address the new channel (D-65c).
+ *
+ * Throws `PLUGIN_INSTANTIATE_FAILED` on extraction or container-kind
+ * mismatch. Best-effort: FL UI loads the resulting preset; IPC binding
+ * works in the cases we've tested but may fail on edge inputs (R17).
+ */
+export function loadFactoryGeneratorPreset(
+  project: FLPProject,
+  donor: FLPProject,
+  opts: { name?: string } = {},
+): { project: FLPProject; iid: number } {
+  let extracted;
+  try {
+    extracted = extractPluginScopeFromFst(donor);
+  } catch (err) {
+    if (err instanceof FstParseError) {
+      throw new MutationError("PLUGIN_INSTANTIATE_FAILED", `donor .fst: ${err.message}`);
+    }
+    throw err;
+  }
+
+  const displayName =
+    opts.name ?? extracted.pluginDisplayName ?? extracted.pluginInternalName;
+
+  const newIid = nextChannelIid(project.events);
+  if (newIid > 0xffff) {
+    throw new MutationError(
+      "EVENT_NOT_FOUND",
+      `cannot allocate new channel iid: max u16 (${0xffff}) reached`,
+    );
+  }
+
+  const insertAt = findInsertionBeforeArrangements(project.events);
+  const { maxF9, maxF10 } = scanChannelD4UidMaxes(project.events);
+  const newF9 = maxF9 + 1;
+  const newF10 = maxF10 + 1;
+
+  let sawKind = false;
+  let sawName = false;
+  const patchedScope: FLPEvent[] = [];
+
+  for (const ev of extracted.scope) {
+    if (ev.kind === "u8" && ev.opcode === OP_CHANNEL_TYPE) {
+      sawKind = true;
+      patchedScope.push({ ...ev });
+      continue;
+    }
+    if (ev.kind === "blob" && ev.opcode === OP_NAME) {
+      sawName = true;
+      patchedScope.push({
+        kind: "blob",
+        opcode: OP_NAME,
+        payload: encodeUtf16LeNullTerminated(displayName),
+      });
+      continue;
+    }
+    if (
+      ev.kind === "blob" &&
+      ev.opcode === OP_PLUGIN_RUNTIME_DATA &&
+      ev.payload.byteLength >= 44
+    ) {
+      const newPayload = new Uint8Array(ev.payload);
+      const view = new DataView(newPayload.buffer, newPayload.byteOffset, newPayload.byteLength);
+      view.setUint32(36, newF9, true);
+      view.setUint32(40, newF10, true);
+      patchedScope.push({
+        kind: "blob",
+        opcode: OP_PLUGIN_RUNTIME_DATA,
+        payload: newPayload,
+      });
+      continue;
+    }
+    if (ev.kind === "blob") {
+      patchedScope.push({ kind: "blob", opcode: ev.opcode, payload: new Uint8Array(ev.payload) });
+    } else {
+      patchedScope.push({ ...ev });
+    }
+  }
+
+  const prelude: FLPEvent[] = [{ kind: "u16", opcode: OP_NEW_CHANNEL, value: newIid }];
+  if (!sawKind) {
+    prelude.push({ kind: "u8", opcode: OP_CHANNEL_TYPE, value: 1 }); // 1 = instrument
+  }
+  if (!sawName) {
+    prelude.push({
+      kind: "blob",
+      opcode: OP_NAME,
+      payload: encodeUtf16LeNullTerminated(displayName),
+    });
+  }
+
+  const events = [...project.events];
+  events.splice(insertAt, 0, ...prelude, ...patchedScope);
+  bindUidToFirstUnusedTrack(events, newF9);
+
+  return { project: { ...project, events }, iid: newIid };
+}
+
+/**
+ * Splice an effect preset (`.fst`) into a mixer slot of `project`. Returns
+ * the mutated project + the FL IPC slot index where the plugin will appear
+ * (= `slot_marker + 1`).
+ *
+ * Thin wrapper over F6.6 `craftPluginFixture`: the `.fst` extractor yields
+ * the same event-list shape that craftPluginFixture expects, so we hand
+ * the donor scope directly through.
+ *
+ * Throws `PLUGIN_INSTANTIATE_FAILED` on extraction failure or when the
+ * target `(insert_index, slot_marker)` doesn't exist in the project.
+ */
+export function loadFactoryEffectPreset(
+  project: FLPProject,
+  donor: FLPProject,
+  target: { insert_index: number; slot_marker: number },
+): { project: FLPProject; fl_ipc_slot_index: number } {
+  let extracted;
+  try {
+    extracted = extractPluginScopeFromFst(donor);
+  } catch (err) {
+    if (err instanceof FstParseError) {
+      throw new MutationError("PLUGIN_INSTANTIATE_FAILED", `donor .fst: ${err.message}`);
+    }
+    throw err;
+  }
+  let mutated;
+  try {
+    mutated = craftPluginFixture(project, extracted.scope, target.insert_index, target.slot_marker);
+  } catch (err) {
+    throw new MutationError(
+      "PLUGIN_INSTANTIATE_FAILED",
+      `splice into insert=${target.insert_index} slot_marker=${target.slot_marker}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return {
+    project: mutated,
+    fl_ipc_slot_index: target.slot_marker + 1,
   };
 }
 
