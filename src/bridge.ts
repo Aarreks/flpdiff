@@ -83,6 +83,8 @@ import {
   type SongSection,
   instantiateNativePlugin,
   setChannelSamplePath,
+  loadFactoryGeneratorPreset,
+  loadFactoryEffectPreset,
   MutationError,
   type RGBA,
   type ClipPlacement,
@@ -95,6 +97,29 @@ type BridgeRequest = {
   kind: string;
   args?: Record<string, unknown>;
 };
+
+/**
+ * Expand FL library-token path prefixes into absolute filesystem paths.
+ *
+ * The factory-preset + factory-sample manifests emit FL's
+ * `%FLStudioFactoryData%/...` tokens (matching what FL itself writes
+ * inside `.flp` event payloads). This helper expands those tokens so
+ * the bridge can `readFileSync` the donor `.fst` without round-tripping
+ * through FL.
+ *
+ * The substitution targets the macOS install location; non-macOS or
+ * non-default installs need the env var override (Phase F9.5 future).
+ */
+function resolveFlToken(p: string): string {
+  if (p.startsWith("%FLStudioFactoryData%")) {
+    const tail = p.slice("%FLStudioFactoryData%".length).replace(/^\/+/, "");
+    return resolve(
+      "/Applications/FL Studio 2025.app/Contents/Resources/FL",
+      tail,
+    );
+  }
+  return resolve(p);
+}
 
 type BridgeOk = {
   ok: true;
@@ -173,6 +198,8 @@ const WRITE_KINDS = new Set([
   "instantiate_native_plugin",
   // Epic 7 / F7.1 — sample-path setter
   "set_channel_sample_path",
+  // Epic 9 / F9.5 — load factory plugin preset from a .fst donor
+  "load_factory_preset",
 ]);
 
 /**
@@ -466,6 +493,15 @@ const ALLOWED_ARGS: Record<string, ReadonlySet<string>> = {
     "slot_marker",
   ]),
   set_channel_sample_path: new Set(["path", "iid", "sample_path"]),
+  // Epic 9 / F9.5 — load factory plugin preset onto a target FLP
+  load_factory_preset: new Set([
+    "path",
+    "fst_path",
+    "kind",
+    "name",
+    "insert_index",
+    "slot_marker",
+  ]),
 };
 
 // Common LLM-natural aliases → canonical arg name. Applied per-kind
@@ -1083,6 +1119,74 @@ function executeWrite(
         );
       }
       mutated = setChannelSamplePath(project, iid, samplePath);
+    } else if (kind === "load_factory_preset") {
+      // F9.5 — splice a .fst plugin preset into the target FLP.
+      // `fst_path` accepts either an absolute path or the FL library-token
+      // form (%FLStudioFactoryData%/...) produced by list_factory_presets.
+      const fstPathArg = String(args["fst_path"] ?? "");
+      const presetKind = String(args["kind"] ?? "generator");
+      if (!fstPathArg) {
+        throw new MutationError("INVALID_ARGS", "args.fst_path required");
+      }
+      if (presetKind !== "generator" && presetKind !== "effect") {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.kind must be 'generator' or 'effect'",
+        );
+      }
+      const resolvedFst = resolveFlToken(fstPathArg);
+      let donorBytes: Buffer;
+      try {
+        donorBytes = readFileSync(resolvedFst);
+      } catch (err) {
+        throw new MutationError(
+          "PRESET_FILE_NOT_FOUND",
+          `cannot read .fst at ${resolvedFst}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      const donor = parseFLPFile(donorBytes.buffer.slice(
+        donorBytes.byteOffset,
+        donorBytes.byteOffset + donorBytes.byteLength,
+      ));
+      if (presetKind === "generator") {
+        const name = args["name"] !== undefined ? String(args["name"]) : undefined;
+        const result = loadFactoryGeneratorPreset(project, donor, { name });
+        const bytes = serializeFLPProject(result.project);
+        writeFileSync(resolve(path), bytes);
+        return {
+          ok: true,
+          kind,
+          result: {
+            path: resolve(path),
+            bytes_written: bytes.byteLength,
+            channel_iid: result.iid,
+          },
+        };
+      }
+      // effect
+      const insertIdx = Number(args["insert_index"] ?? -1);
+      const slotMarker = Number(args["slot_marker"] ?? -1);
+      if (!Number.isInteger(insertIdx) || insertIdx < 0 || !Number.isInteger(slotMarker) || slotMarker < 0) {
+        throw new MutationError(
+          "INVALID_ARGS",
+          "args.insert_index + args.slot_marker required (non-negative ints) for kind='effect'",
+        );
+      }
+      const result = loadFactoryEffectPreset(project, donor, {
+        insert_index: insertIdx,
+        slot_marker: slotMarker,
+      });
+      const bytes = serializeFLPProject(result.project);
+      writeFileSync(resolve(path), bytes);
+      return {
+        ok: true,
+        kind,
+        result: {
+          path: resolve(path),
+          bytes_written: bytes.byteLength,
+          fl_ipc_slot_index: result.fl_ipc_slot_index,
+        },
+      };
     } else if (kind === "instantiate_native_plugin") {
       const donorPath = String(args["donor_path"] ?? "");
       const pluginName = String(args["plugin_name"] ?? "");
