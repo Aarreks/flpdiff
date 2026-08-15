@@ -164,3 +164,24 @@ export { comparePattern } from "./diff/comparator.ts";
 export type { RenderSummaryOptions } from "./diff/summary.ts";
 export { renderSummary } from "./diff/summary.ts";
 export { colorizeSummary } from "./diff/colorize.ts";
+
+export type {
+  SamplePathKind,
+  SampleResolutionStatus,
+  PreflightSeverity,
+  SampleReference,
+  PluginDependency,
+  DuplicateContentGroup,
+  PreflightIssue,
+  PreflightStats,
+  PreflightReport,
+  PreflightOptions,
+} from "./preflight.ts";
+export {
+  classifySamplePath,
+  analyzePreflight,
+  renderPreflight,
+  preflightHasErrors,
+  preflightHasWarnings,
+  formatBytes,
+} from "./preflight.ts";

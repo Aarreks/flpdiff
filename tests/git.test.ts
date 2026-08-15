@@ -265,7 +265,7 @@ describe("CLI — git-setup + git-driver subcommand dispatch", () => {
 // --------------------------------------------------------------------- //
 
 import { verifyGit, renderVerifyReport } from "../src/git.ts";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 
 function initRepo(dir: string): void {
   execSync("git init -q", { cwd: dir });
@@ -298,33 +298,35 @@ describe("verifyGit", () => {
     expect(labels.some((l) => l.includes("diff.flp"))).toBe(true);
   });
 
-  test("reports ok after a real setupGit call with an absolute binary path", () => {
+  test("verifies a real setupGit call with a cross-platform absolute binary path", () => {
     const dir = mkTmp("flpdiff-verify-");
     initRepo(dir);
-    // Fake a binary at a stable path so verify's executable check
-    // has something to find. We use `echo` — it exists on every
-    // POSIX system and the --version smoke test will fail (not
-    // an "ok" status), so we expect "warn" overall, not "ok".
+    // Use the executable running the test (Bun) as a guaranteed,
+    // cross-platform absolute binary path. `bun --version` succeeds
+    // but does not identify itself as flpdiff, so verify should warn
+    // rather than fail because the configured executable is missing.
     setupGit({
       scope: "local",
       mode: "command",
       repoRoot: dir,
       runner: (cmd) => {
-        // Actually apply config to THIS repo. Mirror defaultRunner's
-        // behaviour: --unset is allowed to fail on missing keys.
+        // Actually apply config to THIS repo without routing through a
+        // shell. This keeps quoting/path semantics identical on Windows,
+        // macOS, and Linux. Mirror defaultRunner's behaviour: --unset is
+        // allowed to fail when a key is already absent.
         const suppress = cmd.length > 3 && cmd[3] === "--unset";
         try {
-          execSync(cmd.map((a) => JSON.stringify(a)).join(" "), { cwd: dir, stdio: "ignore" });
+          execFileSync(cmd[0]!, cmd.slice(1), { cwd: dir, stdio: "ignore" });
           return 0;
         } catch {
           return suppress ? 0 : 1;
         }
       },
-      executablePath: "/bin/echo",
+      executablePath: process.execPath,
     });
     const result = verifyGit({ repoRoot: dir });
-    // /bin/echo exists but `echo --version` doesn't start with
-    // "flpdiff " — so smoke test is "warn". Overall status: warn.
+    // Bun exists but `bun --version` does not start with "flpdiff ",
+    // so the smoke test is "warn". Overall status should be warn/ok.
     expect(["warn", "ok"]).toContain(result.status);
     const labels = result.checks.map((c) => c.label);
     expect(labels.some((l) => l.includes("rule present"))).toBe(true);

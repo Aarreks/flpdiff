@@ -4,6 +4,7 @@
  *
  *   flpdiff A.flp B.flp [--verbose]       # diff (default)
  *   flpdiff info A.flp [--format ...]     # single-file report
+ *   flpdiff preflight A.flp [options]     # dependency / portability check
  *   flpdiff git-setup ...                 # git integration (Phase L2)
  *   flpdiff git-driver ...                # internal driver (Phase L2)
  *
@@ -19,6 +20,12 @@ import { diffSummaryHasChanges } from "./diff/diff-model.ts";
 import { toFlpInfoJson } from "./presentation/flp-info.ts";
 import { renderInfo } from "./info.ts";
 import { renderCanonical } from "./canonical.ts";
+import {
+  analyzePreflight,
+  preflightHasErrors,
+  preflightHasWarnings,
+  renderPreflight,
+} from "./preflight.ts";
 import {
   gitDriverMain,
   setupGit,
@@ -36,7 +43,7 @@ const EXIT_IDENTICAL = 0;
 const EXIT_DIFFERENCES = 1;
 const EXIT_ERROR = 2;
 
-export const ISSUE_URL = "https://github.com/dawhubapp/flpdiff/issues";
+export const ISSUE_URL = "https://github.com/Aarreks/flpdiff/issues";
 const VERSION: string = packageJson.version;
 
 const USAGE = `Usage:
@@ -44,20 +51,27 @@ const USAGE = `Usage:
                                               Semantic diff between two FLPs
   flpdiff info <file.flp> [--format F]        Inspect a single FLP
     F ∈ text (default) | json | canonical
+  flpdiff preflight <file.flp> [options]       Check backup/collaboration portability
+    --root DIR                                 Resolve relative samples from DIR
+    --token NAME=DIR                           Map an FL path token (repeatable)
+    --search-path DIR                          Add a relative-sample lookup root (repeatable)
+    --hash                                     SHA-256 samples + find duplicate content
+    --strict                                   Treat warnings as exit code 1
+    --format text|json                         Output format (default: text)
   flpdiff git-setup [--global] [--textconv] [--lfs]
                                               Configure git to use flpdiff as the FLP diff driver
   flpdiff git-verify                          Diagnose the current repo's flpdiff git setup
   flpdiff git-driver <...7 or 9 args...>      Internal: invoked by git's external-diff protocol
   flpdiff --help | --version
 
-Exit codes (diff):
-  0  files are semantically identical
-  1  one or more differences found
-  2  parse or I/O error
+Exit codes:
+  diff:       0 identical, 1 differences, 2 parse/I/O error
+  preflight:  0 pass, 1 missing dependency (or warning with --strict), 2 error
 `;
 
 const SUBCOMMANDS = new Set([
   "info",
+  "preflight",
   "git-setup",
   "git-driver",
   "git-verify",
@@ -86,6 +100,8 @@ export async function run(argv: readonly string[]): Promise<number> {
     switch (first) {
       case "info":
         return runInfo(rest);
+      case "preflight":
+        return runPreflight(rest);
       case "git-setup":
         return runGitSetup(rest);
       case "git-verify":
@@ -190,6 +206,100 @@ async function runInfo(argv: readonly string[]): Promise<number> {
     } else {
       console.log(renderInfo(project, path));
     }
+    return EXIT_IDENTICAL;
+  } catch (e) {
+    return handleError(e);
+  }
+}
+
+async function runPreflight(argv: readonly string[]): Promise<number> {
+  const args = [...argv];
+  let format: "text" | "json" = "text";
+  let root: string | undefined;
+  let hash = false;
+  let strict = false;
+  const tokenRoots: Record<string, string> = {};
+  const searchPaths: string[] = [];
+
+  for (let i = args.length - 1; i >= 0; i--) {
+    const a = args[i];
+    if (a === "--hash") {
+      args.splice(i, 1);
+      hash = true;
+    } else if (a === "--strict") {
+      args.splice(i, 1);
+      strict = true;
+    } else if (a === "--format" || a === "-f") {
+      const v = args[i + 1];
+      if (v !== "text" && v !== "json") {
+        console.error("flpdiff preflight: --format expects 'text' | 'json'");
+        return EXIT_ERROR;
+      }
+      format = v;
+      args.splice(i, 2);
+    } else if (a === "--root") {
+      const v = args[i + 1];
+      if (!v || v.startsWith("--")) {
+        console.error("flpdiff preflight: --root expects a directory");
+        return EXIT_ERROR;
+      }
+      root = v;
+      args.splice(i, 2);
+    } else if (a === "--search-path") {
+      const v = args[i + 1];
+      if (!v || v.startsWith("--")) {
+        console.error("flpdiff preflight: --search-path expects a directory");
+        return EXIT_ERROR;
+      }
+      searchPaths.unshift(v);
+      args.splice(i, 2);
+    } else if (a === "--token") {
+      const v = args[i + 1];
+      if (!v || v.startsWith("--")) {
+        console.error("flpdiff preflight: --token expects NAME=DIR");
+        return EXIT_ERROR;
+      }
+      const eq = v.indexOf("=");
+      if (eq <= 0 || eq === v.length - 1) {
+        console.error("flpdiff preflight: --token expects NAME=DIR");
+        return EXIT_ERROR;
+      }
+      const name = v.slice(0, eq).replace(/^%+|%+$/g, "");
+      const dir = v.slice(eq + 1);
+      if (name.length === 0 || name.includes("%")) {
+        console.error("flpdiff preflight: --token expects NAME=DIR");
+        return EXIT_ERROR;
+      }
+      tokenRoots[name] = dir;
+      args.splice(i, 2);
+    }
+  }
+
+  if (args.length !== 1) {
+    console.error(
+      "Usage: flpdiff preflight <file.flp> [--root DIR] [--token NAME=DIR] [--search-path DIR] [--hash] [--strict] [--format text|json]",
+    );
+    return EXIT_ERROR;
+  }
+  const [path] = args as [string];
+
+  try {
+    const buf = await Bun.file(path).arrayBuffer();
+    const project = parseFLPFile(buf);
+    const report = await analyzePreflight(project, path, {
+      ...(root !== undefined ? { root } : {}),
+      tokenRoots,
+      searchPaths,
+      hash,
+    });
+    if (format === "json") {
+      console.log(JSON.stringify(report, sortedReplacer, 2));
+    } else {
+      console.log(renderPreflight(report, { hashed: hash }));
+    }
+
+    if (preflightHasErrors(report)) return EXIT_DIFFERENCES;
+    if (strict && preflightHasWarnings(report)) return EXIT_DIFFERENCES;
     return EXIT_IDENTICAL;
   } catch (e) {
     return handleError(e);

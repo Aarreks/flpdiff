@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Experimental fork additions (unreleased)
+
+These entries apply to this unofficial fork, not to the upstream project's
+release history. See [`FORK_CHANGES.md`](FORK_CHANGES.md) for attribution and
+scope.
+
+### Added
+
+- `flpdiff preflight <file.flp>` inventories external sample and plugin
+  dependencies before a backup or collaborator handoff. Relative audio paths
+  are checked against the project root, FL `%TOKEN%` paths can be resolved
+  with repeatable `--token NAME=DIR` mappings, missing files are reported as
+  errors, and machine-specific absolute/out-of-root paths are flagged as
+  portability warnings. `--format json` exposes the same report to scripts and
+  `--strict` makes warnings CI-failing.
+- `flpdiff preflight --hash` streams resolved sample files through SHA-256 and
+  reports byte-identical duplicates plus the redundant byte count. Alternate
+  path spellings that resolve to the same pathname are counted once for storage
+  estimates. This provides a concrete estimate of savings available to
+  content-addressed backup storage without loading large audio files into
+  memory.
+
+### Fixed
+
+- Made the existing `verifyGit` integration test platform-independent by using
+  the active Bun executable and shell-free process invocation instead of the
+  POSIX-only `/bin/echo` path. This fixes the test on native Windows without
+  changing production Git behavior.
+
+
 ## [Unreleased]
 
 ### Fixed

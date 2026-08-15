@@ -1,5 +1,61 @@
 # flpdiff
 
+> [!IMPORTANT]
+> **Unofficial experimental fork.** The original `flpdiff` project was created by
+> **Roman Pronskiy** and is maintained upstream at
+> [`dawhubapp/flpdiff`](https://github.com/dawhubapp/flpdiff). The FLP parser,
+> semantic diff engine, Git integration, CLI foundation, tests, documentation,
+> and the large majority of this repository come from the upstream project.
+> This fork adds an experimental **project preflight / storage analysis**
+> feature for checking external audio references, plugin dependencies, path
+> portability, and byte-identical audio duplication before backup or handoff.
+> It is not affiliated with or endorsed by the upstream maintainer. See
+> [`FORK_CHANGES.md`](FORK_CHANGES.md) for an exact scope summary.
+
+> [!NOTE]
+> The upstream install commands below install the published upstream release.
+> They **do not include this fork's experimental `preflight` command**. To test
+> the fork-only feature, clone this fork and run it from source with Bun. See
+> [`FLPDIFF_TESTING.md`](FLPDIFF_TESTING.md).
+
+## Test this fork from source
+
+Clone this repository using the URL from GitHub's **Code** button, then run:
+
+```sh
+cd flpdiff
+bun install
+bun run src/cli.ts preflight path/to/project.flp
+```
+
+For controlled validation, including a deliberately missing WAV and a
+deliberate duplicate-audio treatment, follow [`FLPDIFF_TESTING.md`](FLPDIFF_TESTING.md).
+
+Useful fork-only variants:
+
+```sh
+# Fingerprint referenced audio and estimate byte-identical duplication.
+bun run src/cli.ts preflight project.flp --hash
+
+# Resolve an FL Studio token so those references can be verified.
+bun run src/cli.ts preflight project.flp --token FLStudioFactoryData="D:/path/to/FL-Studio-factory-data"
+
+# Add another root to try for relative sample references (repeatable).
+bun run src/cli.ts preflight project.flp --search-path "D:/Samples"
+
+# Stable machine-readable report for scripts or CI.
+bun run src/cli.ts preflight project.flp --hash --format json
+```
+
+`--hash` detects only byte-identical files. It deliberately does not claim that
+re-encoded or merely similar audio is duplicate content.
+
+FL Studio can also locate samples through configured search folders. Preflight
+cannot automatically know another machine's full FL Studio search configuration,
+so repeat `--search-path DIR` for any additional roots you want checked. A sample
+found only through one of those roots is still flagged as a portability warning,
+because a project-only backup would not contain it.
+
 See what changed between two FL Studio `.flp` saves — channel by
 channel, note by note.
 
@@ -178,6 +234,65 @@ Samples: 909 Kick.wav, Hat_closed.wav, vocal_chop_01.wav, … and 12 more
 structure for scripting. `--format canonical` produces a stable,
 line-oriented dump used by the git textconv integration.
 
+## Preflight a project before backup or handoff
+
+An `.flp` is not a self-contained archive: sampler channels can point at
+external audio, and VSTs have to exist on the machine that opens the project.
+`flpdiff preflight` turns those hidden dependencies into a machine-readable
+manifest before you trust a backup or send the project to someone else.
+
+```sh
+$ flpdiff preflight my_track.flp
+FLP Preflight: my_track.flp
+Root: /music/my_track
+
+Samples: 18 refs, 15 unique paths, 12 resolved, 1 missing, 2 unverified
+Resolved audio: 6.84 GiB
+
+Referenced audio:
+  OK kick.wav (2.14 MiB), 3 channels
+     samples/kick.wav
+  !! take_37.wav
+     ../recordings/take_37.wav
+     WARN: Relative sample path escapes the project root and may be omitted from a backup or handoff.
+     ERROR: Referenced sample does not exist: /music/recordings/take_37.wav
+  ?? 909 Kick.wav
+     %FLStudioFactoryData%/Data/Patches/Packs/Drums/Kicks/909 Kick.wav
+     WARN: Cannot verify %FLStudioFactoryData% without a token mapping; pass --token FLStudioFactoryData=<directory>.
+
+Plugins: 4 external VST, 7 native
+  VST    Serum — Xfer Records ×2
+  VST    ValhallaVintageVerb — Valhalla DSP
+  ...
+
+Result: FAIL — 1 error, 2 warnings
+```
+
+Relative sample paths resolve against the FLP's directory by default. Override
+that with `--root DIR`, and map FL library tokens with repeatable
+`--token NAME=DIR` flags.
+
+For large projects, add `--hash` to fingerprint resolved sample content with
+SHA-256. The report detects byte-identical audio stored under different
+filenames and estimates how many bytes content-addressed backup storage could
+avoid duplicating. Alternate path spellings that resolve to the same file are
+counted once in storage estimates:
+
+```sh
+flpdiff preflight my_track.flp --hash
+```
+
+Hashing is opt-in because reading 100+ GB of audio can take a while. Use
+`--format json` for backup tooling and CI. By default only missing samples make
+preflight exit `1`; `--strict` also treats portability warnings as a failing
+preflight.
+
+Scope note: preflight can only analyze dependencies represented in the parsed
+FLP structure. It inventories FLP-level sample references and plugin names; it
+does not inspect private sample libraries inside third-party plugins (for
+example Kontakt libraries), and it does not verify that a VST binary is
+currently installed.
+
 ## FL Studio compatibility
 
 Tested across every FL major from 9 through 25, against 85 real-world
@@ -220,6 +335,9 @@ flpdiff [--verbose] [--color|--no-color] <A.flp> <B.flp>
                                             Semantic diff of two FLPs
 flpdiff info <file.flp> [--format F]        Inspect a single FLP
                                               F ∈ text (default) | json | canonical
+flpdiff preflight <file.flp> [options]       Inventory external samples/plugins
+                                              --root DIR --token NAME=DIR
+                                              --hash --strict --format text|json
 flpdiff git-setup [--global] [--textconv] [--lfs]
                                             Configure git to diff .flp files semantically
 flpdiff git-verify                          Diagnose the current repo's flpdiff git setup

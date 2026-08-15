@@ -23,13 +23,13 @@
     "email": "roman@pronskiy.com",
     "url": "https://pronskiy.com"
   },
-  "homepage": "https://github.com/dawhubapp/flpdiff",
+  "homepage": "https://github.com/Aarreks/flpdiff",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dawhubapp/flpdiff.git"
+    "url": "git+https://github.com/Aarreks/flpdiff.git"
   },
   "bugs": {
-    "url": "https://github.com/dawhubapp/flpdiff/issues"
+    "url": "https://github.com/Aarreks/flpdiff/issues"
   },
   "module": "src/index.ts",
   "main": "src/index.ts",
@@ -66,5 +66,12 @@
   },
   "dependencies": {
     "typed-binary": "^4.3.3"
-  }
+  },
+  "private": true,
+  "contributors": [
+    {
+      "name": "Aarreks",
+      "url": "https://github.com/Aarreks"
+    }
+  ]
 }

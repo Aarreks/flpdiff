@@ -150,6 +150,41 @@ describe("CLI — info subcommand", () => {
   });
 });
 
+describe("CLI — preflight subcommand", () => {
+  test("preflight exits 0 for warnings in default mode", async () => {
+    // base_one_channel references %FLStudioFactoryData%, which is intentionally
+    // unverified unless the caller supplies --token. Warnings are non-fatal by
+    // default so preflight remains useful interactively.
+    const code = await run(["preflight", OTHER]);
+    expect(code).toBe(0);
+  });
+
+  test("preflight --strict turns portability warnings into exit 1", async () => {
+    const code = await run(["preflight", OTHER, "--strict"]);
+    expect(code).toBe(1);
+  });
+
+  test("preflight accepts a repeatable search path", async () => {
+    const code = await run(["preflight", OTHER, "--search-path", ".", "--search-path", "tests"]);
+    expect(code).toBe(0);
+  });
+
+  test("preflight rejects malformed token mappings", async () => {
+    const code = await run(["preflight", OTHER, "--token", "not-a-mapping"]);
+    expect(code).toBe(2);
+  });
+
+  test("preflight rejects an empty token name", async () => {
+    const code = await run(["preflight", OTHER, "--token", "%=somewhere"]);
+    expect(code).toBe(2);
+  });
+
+  test("preflight supports stable JSON output", async () => {
+    const code = await run(["preflight", OTHER, "--format", "json"]);
+    expect(code).toBe(0);
+  });
+});
+
 describe("CLI — error reporting nudges", () => {
   /** Capture console.error calls produced during `fn()`. */
   async function captureStderr(fn: () => unknown | Promise<unknown>): Promise<string> {
@@ -166,8 +201,8 @@ describe("CLI — error reporting nudges", () => {
     return lines.join("\n");
   }
 
-  test("ISSUE_URL points at the dawhubapp issues tracker", () => {
-    expect(ISSUE_URL).toBe("https://github.com/dawhubapp/flpdiff/issues");
+  test("ISSUE_URL points at this fork's issues tracker", () => {
+    expect(ISSUE_URL).toBe("https://github.com/Aarreks/flpdiff/issues");
   });
 
   test("FLPParseError → 'FLP variant' nudge with FL-version + .flp guidance", async () => {
